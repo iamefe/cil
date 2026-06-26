@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cil"
+version = "0.1.0"
+description = "Code Intelligence Layer — AST-based codebase analysis with semantic enrichment"
+requires-python = ">=3.11"
+dependencies = [
+    "flask>=3.0",
+    "pymongo>=4.6",
+    "mcp>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.14",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+cil = "cil.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cil"]
+
+[tool.hatch.build]
+dev-mode-dirs = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+
