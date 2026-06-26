@@ -5,6 +5,15 @@ from cil.indexer.anomaly_detector import AnomalyDetector
 from cil.models import CILIndex, FileIndex
 
 PYTHON_EXTENSIONS = {".py", ".pyi"}
+SUPPORTED_EXTENSIONS = {
+    ".py", ".pyi",   # Python
+    ".ts", ".tsx",   # TypeScript
+    ".js", ".jsx",   # JavaScript
+    ".go",           # Go
+    ".rs",           # Rust
+    ".java",         # Java
+    ".c", ".h",      # C
+}
 
 
 class Indexer:
@@ -31,7 +40,7 @@ class Indexer:
 
             for fname in files:
                 ext = os.path.splitext(fname)[1]
-                if ext not in PYTHON_EXTENSIONS:
+                if ext not in SUPPORTED_EXTENSIONS:
                     continue
 
                 file_path = os.path.join(root, fname)
