@@ -131,6 +131,16 @@ def create_mcp_server():
                         "type": "string",
                         "description": "Absolute path to the project directory",
                     },
+                    "enrich": {
+                        "type": "boolean",
+                        "description": "Run LLM semantic enrichment (purpose, complexity, audit notes)",
+                        "default": False,
+                    },
+                    "incremental": {
+                        "type": "boolean",
+                        "description": "Only re-index changed files (requires existing index)",
+                        "default": False,
+                    },
                 },
                 "required": ["project_path"],
             },
@@ -209,7 +219,11 @@ def create_mcp_server():
             )
 
         if name == "cil_index_project":
-            return index_project(arguments.get("project_path", ""))
+            return index_project(
+                arguments.get("project_path", ""),
+                arguments.get("enrich", False),
+                arguments.get("incremental", False),
+            )
 
         if name == "cil_file_summary":
             return file_summary(arguments.get("path", ""))
@@ -300,8 +314,9 @@ def create_mcp_server():
         except FileNotFoundError:
             return {"content": [{"type": "text", "text": f"File not found: {file_path}"}], "isError": True}
 
-    def index_project(project_path):
+    def index_project(project_path, enrich=False, incremental=False):
         import os
+        from cil.models import CILIndex
         if not os.path.isdir(project_path):
             return {"content": [{"type": "text", "text": f"Directory not found: {project_path}"}], "isError": True}
 
@@ -309,8 +324,21 @@ def create_mcp_server():
         if not ok:
             return _db_error_response(err)
 
+        # Load previous index for incremental mode
+        previous_index = None
+        if incremental:
+            col = get_collection()
+            doc = col.find_one({"project_path": project_path})
+            if doc:
+                previous_index = CILIndex(**doc)
+
         indexer = Indexer()
-        cil_index = indexer.index_directory(project_path)
+        cil_index = indexer.index_directory(
+            project_path,
+            enrich=enrich,
+            incremental=incremental,
+            previous_index=previous_index,
+        )
 
         col = get_collection()
         col.replace_one(
@@ -324,7 +352,9 @@ def create_mcp_server():
             "project_path": cil_index.project_path,
             "file_count": len(cil_index.file_indices),
             "symbol_count": sum(len(fi.symbols) for fi in cil_index.file_indices.values()),
-        }, indent=2)}]}
+            "enriched": enrich,
+            "incremental": incremental,
+        }, indent=2)}]}  
 
     def file_summary(path):
         ok, err = _db_available()

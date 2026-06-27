@@ -17,6 +17,7 @@ def main():
     index_parser.add_argument("project_path", help="Path to the project directory")
     index_parser.add_argument("--enrich", action="store_true", help="Run LLM semantic enrichment")
     index_parser.add_argument("--force", action="store_true", help="Clear old index before re-indexing")
+    index_parser.add_argument("--incremental", action="store_true", help="Only re-index changed files")
 
     # Status command
     subparsers.add_parser("status", help="Show index status")
@@ -32,6 +33,11 @@ def main():
     anom_parser = subparsers.add_parser("anomalies", help="List detected anomalies")
     anom_parser.add_argument("--severity", choices=["low", "medium", "high"], help="Filter by severity")
     anom_parser.add_argument("--file", help="Filter by file path")
+
+    # Watch command
+    watch_parser = subparsers.add_parser("watch", help="Watch directory for changes and auto-reindex")
+    watch_parser.add_argument("project_path", help="Path to the project directory")
+    watch_parser.add_argument("--enrich", action="store_true", help="Run LLM semantic enrichment on re-index")
 
     # Enrich command
     subparsers.add_parser("enrich", help="Run LLM semantic enrichment on existing index")
@@ -51,8 +57,24 @@ def main():
         if args.force:
             col.delete_one({"project_path": args.project_path})
 
+        # Load previous index for incremental mode
+        previous_index = None
+        if args.incremental:
+            doc = col.find_one({"project_path": args.project_path})
+            if doc:
+                from cil.models import CILIndex
+                previous_index = CILIndex(**doc)
+            else:
+                print("No previous index found, doing full index")
+                args.incremental = False
+
         indexer = Indexer()
-        cil_index = indexer.index_directory(args.project_path, enrich=args.enrich)
+        cil_index = indexer.index_directory(
+            args.project_path,
+            enrich=args.enrich,
+            incremental=args.incremental,
+            previous_index=previous_index,
+        )
 
         col.replace_one(
             {"project_path": cil_index.project_path},
@@ -114,6 +136,11 @@ def main():
                 sev = severity_colors.get(a.get("severity", ""), "?")
                 print(f"  [{sev}] {a['file_path']}:{a['line']} [{a['type']}] {a['message']}")
             print(f"\nTotal: {len(results)} anomalies")
+
+    elif args.command == "watch":
+        from cil.watcher import FileWatcher
+        watcher = FileWatcher(args.project_path, enrich=args.enrich)
+        watcher.start()
 
     elif args.command == "enrich":
         col = get_collection()

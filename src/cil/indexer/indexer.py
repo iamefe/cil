@@ -1,3 +1,4 @@
+import hashlib
 import os
 
 from cil.indexer.ast_parser import ASTParser
@@ -16,6 +17,18 @@ SUPPORTED_EXTENSIONS = {
 }
 
 
+def _file_hash(file_path: str) -> str:
+    """Compute SHA-256 hash of a file's contents."""
+    h = hashlib.sha256()
+    try:
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+    except Exception:
+        return ""
+    return h.hexdigest()
+
+
 class Indexer:
     """Index a Python project directory and produce a CILIndex."""
 
@@ -23,13 +36,41 @@ class Indexer:
         self.parser = ASTParser()
         self.detector = AnomalyDetector()
 
-    def index_directory(self, project_path: str, enrich: bool = False) -> CILIndex:
-        """Walk the directory, parse all Python files, and build the index."""
+    def index_directory(
+        self,
+        project_path: str,
+        enrich: bool = False,
+        incremental: bool = False,
+        previous_index: CILIndex | None = None,
+    ) -> CILIndex:
+        """Walk the directory, parse all Python files, and build the index.
+
+        If incremental=True and previous_index is provided, only re-index
+        files whose hash has changed.
+        """
         project_path = os.path.abspath(project_path)
+
+        # Build previous hash map for incremental mode
+        prev_hashes: dict[str, str] = {}
+        prev_file_indices: dict[str, FileIndex] = {}
+        prev_calls = []
+        prev_mutations = []
+        prev_anomalies = []
+        if incremental and previous_index:
+            for fp, fi in previous_index.file_indices.items():
+                prev_hashes[fp] = fi.file_hash
+                prev_file_indices[fp] = fi
+            prev_calls = list(previous_index.call_graph)
+            prev_mutations = list(previous_index.mutations)
+            prev_anomalies = list(previous_index.anomalies)
+
         file_indices = {}
         all_calls = []
         all_mutations = []
         all_anomalies = []
+        files_skipped = 0
+        files_indexed = 0
+        unchanged_files: set[str] = set()
 
         for root, dirs, files in os.walk(project_path):
             # Skip common non-source directories
@@ -44,8 +85,18 @@ class Indexer:
                     continue
 
                 file_path = os.path.join(root, fname)
+                current_hash = _file_hash(file_path)
+
+                # Incremental: skip unchanged files
+                if incremental and prev_hashes.get(file_path) == current_hash:
+                    file_indices[file_path] = prev_file_indices[file_path]
+                    unchanged_files.add(file_path)
+                    files_skipped += 1
+                    continue
+
                 try:
                     file_index = self.parser.parse_file(file_path)
+                    file_index.file_hash = current_hash
                     file_indices[file_path] = file_index
                     all_calls.extend(self.parser.calls)
                     all_mutations.extend(self.parser.mutations)
@@ -59,20 +110,40 @@ class Indexer:
                     # Enrich symbols with risk_flags from anomalies
                     self._enrich_symbols(file_index, anomalies)
 
+                    files_indexed += 1
+
                 except Exception as e:
                     print(f"Warning: failed to parse {file_path}: {e}")
+
+        # In incremental mode, preserve call graph/mutations/anomalies
+        # for unchanged files
+        if incremental and unchanged_files:
+            for c in prev_calls:
+                if c.caller.split(":")[0] in unchanged_files:
+                    all_calls.append(c)
+            for m in prev_mutations:
+                if m.source.split(":")[0] in unchanged_files:
+                    all_mutations.append(m)
+            for a in prev_anomalies:
+                if a.file_path in unchanged_files:
+                    all_anomalies.append(a)
 
         # Optional LLM enrichment
         if enrich:
             self._llm_enrich(file_indices)
 
-        return CILIndex(
+        cil_index = CILIndex(
             project_path=project_path,
             file_indices=file_indices,
             call_graph=all_calls,
             mutations=all_mutations,
             anomalies=all_anomalies,
         )
+
+        if incremental:
+            print(f"  Incremental: {files_indexed} files indexed, {files_skipped} skipped")
+
+        return cil_index
 
     def _enrich_symbols(self, file_index: FileIndex, anomalies: list[dict]):
         """Add risk_flags to symbols based on detected anomalies."""

@@ -42,6 +42,7 @@ class FileIndex(BaseModel):
     symbols: list[SymbolInfo] = Field(default_factory=list)
     imports: list[str] = Field(default_factory=list)
     indexed_at: datetime = Field(default_factory=datetime.utcnow)
+    file_hash: str = ""
 
 
 class Anomaly(BaseModel):

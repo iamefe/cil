@@ -108,6 +108,6 @@ CIL is not tied to any single project. It works for any agent that supports MCP 
 - [x] Multi-language support — Python, TypeScript, JavaScript, Go, Rust, Java, C
 - [x] MongoDB storage — persistent, queryable index
 - [x] MCP integration — OpenCode tool registration
-- [ ] LLM semantic enrichment — purpose generation, risk scoring (optional, `--enrich`)
-- [ ] File watch mode — auto-reindex on change
-- [ ] Incremental indexing — only re-index changed files
+- [x] LLM semantic enrichment — purpose generation, risk scoring (optional, `--enrich`)
+- [x] File watch mode — auto-reindex on change (`cil watch`)
+- [x] Incremental indexing — only re-index changed files (`--incremental`)
