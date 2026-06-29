@@ -14,7 +14,6 @@ def create_app(use_sqlite=False) -> Flask:
         """Health check — MongoDB or SQLite connectivity."""
         if use_sqlite:
             try:
-                sqlite_db.initialize_db()
                 return jsonify({"status": "ok", "backend": "sqlite", "db_path": str(sqlite_db.get_db_path())})
             except Exception as e:
                 return jsonify({"status": "error", "detail": str(e)}), 503
@@ -95,7 +94,6 @@ def create_app(use_sqlite=False) -> Flask:
         })
 
     def _cil_index_sqlite(project_path, enrich, incremental):
-        sqlite_db.initialize_db()
         from cil.models import CILIndex
         previous_index = None
         if incremental:

@@ -38,7 +38,7 @@ def create_mcp_server(use_sqlite=False):
     tools = [
         {
             "name": "cil_db_status",
-            "description": "Check MongoDB connectivity status.",
+            "description": "Check database connectivity status (MongoDB or SQLite).",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -125,7 +125,7 @@ def create_mcp_server(use_sqlite=False):
         },
         {
             "name": "cil_index_project",
-            "description": "Index a Python project directory. Stores results in MongoDB or SQLite depending on mode.",
+            "description": "Index a project directory. Stores results in MongoDB or SQLite depending on mode.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -240,8 +240,8 @@ def create_mcp_server(use_sqlite=False):
     def db_status():
         if use_sqlite:
             try:
-                sqlite_db.initialize_db()
-                return {"content": [{"type": "text", "text": json.dumps({"status": "ok", "backend": "sqlite", "db_path": sqlite_db.get_db_path()}, indent=2)}]}
+                db_path = os.environ.get("CIL_SQLITE_DB") or str(sqlite_db.PROJECTS_DIR)
+                return {"content": [{"type": "text", "text": json.dumps({"status": "ok", "backend": "sqlite", "db_path": db_path}, indent=2)}]}
             except Exception as e:
                 return {"content": [{"type": "text", "text": json.dumps({"status": "error", "detail": str(e)}, indent=2)}], "isError": True}
         ok, err = _db_available()
@@ -378,7 +378,6 @@ def create_mcp_server(use_sqlite=False):
         }, indent=2)}]}
 
     def _index_project_sqlite(project_path, enrich, incremental):
-        sqlite_db.initialize_db()
         previous_index = None
         if incremental:
             previous_index = sqlite_db.load_index(project_path)

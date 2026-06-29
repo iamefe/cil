@@ -15,7 +15,7 @@ def main():
     subparsers = parser.add_subparsers(dest="command")
 
     # Index command
-    index_parser = subparsers.add_parser("index", help="Index a Python project")
+    index_parser = subparsers.add_parser("index", help="Index a project")
     index_parser.add_argument("project_path", help="Path to the project directory")
     index_parser.add_argument("--enrich", action="store_true", help="Run LLM semantic enrichment")
     index_parser.add_argument("--force", action="store_true", help="Clear old index before re-indexing")
@@ -47,6 +47,10 @@ def main():
     watch_parser.add_argument("--enrich", action="store_true", help="Run LLM semantic enrichment on re-index")
     watch_parser.add_argument("--sqlite", action="store_true", help="Use SQLite instead of MongoDB")
 
+    # Remove command
+    remove_parser = subparsers.add_parser("remove", help="Remove a project from SQLite")
+    remove_parser.add_argument("project_path", help="Path to the project directory")
+
     # Enrich command
     enrich_parser = subparsers.add_parser("enrich", help="Run LLM semantic enrichment on existing index")
     enrich_parser.add_argument("--sqlite", action="store_true", help="Use SQLite instead of MongoDB")
@@ -58,6 +62,8 @@ def main():
     sqlite_sub.add_parser("migrate", help="Migrate data from MongoDB to SQLite")
     sqlite_query = sqlite_sub.add_parser("query", help="Query SQLite database")
     sqlite_query.add_argument("symbol", help="Symbol name to find")
+    sqlite_remove = sqlite_sub.add_parser("remove", help="Remove a project from SQLite")
+    sqlite_remove.add_argument("project_path", help="Path to the project directory")
 
     args = parser.parse_args()
 
@@ -101,6 +107,10 @@ def main():
         from cil.watcher import FileWatcher
         watcher = FileWatcher(args.project_path, enrich=args.enrich, use_sqlite=args.sqlite)
         watcher.start()
+
+    elif args.command == "remove":
+        sqlite_db.remove_project(args.project_path)
+        print(f"Removed project: {args.project_path}")
 
     elif args.command == "enrich":
         if args.sqlite:
@@ -192,7 +202,6 @@ def _index_mongodb(args):
 
 def _status_sqlite():
     """Show index status from SQLite."""
-    sqlite_db.initialize_db()
     projects = sqlite_db.get_status()
     if not projects:
         print("No indexed projects")
@@ -212,7 +221,6 @@ def _status_mongodb():
 
 def _query_sqlite(args):
     """Query the index from SQLite."""
-    sqlite_db.initialize_db()
     results = sqlite_db.find_symbol(args.symbol)
     if not results:
         print(f"No symbols matching '{args.symbol}'")
@@ -239,7 +247,6 @@ def _query_mongodb(args):
 
 def _anomalies_sqlite(args):
     """List anomalies from SQLite."""
-    sqlite_db.initialize_db()
     results = sqlite_db.get_anomalies(severity=args.severity)
     if args.file:
         results = [a for a in results if args.file in a.get("file_path", "")]
@@ -281,7 +288,6 @@ def _enrich_sqlite():
     """Run LLM enrichment on SQLite index."""
     from cil.enricher.enricher import SemanticEnricher
 
-    sqlite_db.initialize_db()
     enricher = SemanticEnricher()
     if not enricher.api_key:
         print("Warning: OPENAI_API_KEY not set, skipping LLM enrichment")
@@ -361,12 +367,15 @@ def _sqlite_command(args):
         sqlite_db.migrate_from_mongodb()
 
     elif args.sqlite_command == "query":
-        sqlite_db.initialize_db()
         results = sqlite_db.find_symbol(args.symbol)
         print(json.dumps(results, indent=2, default=str))
 
+    elif args.sqlite_command == "remove":
+        sqlite_db.remove_project(args.project_path)
+        print(f"Removed project: {args.project_path}")
+
     else:
-        print("Unknown SQLite command. Use: init, migrate, query")
+        print("Unknown SQLite command. Use: init, migrate, query, remove")
 
 
 if __name__ == "__main__":

@@ -154,7 +154,7 @@ def get_connection(db_path: Optional[Path] = None) -> sqlite3.Connection:
     return conn
 
 
-def initialize_db(project_path: str, db_path: Optional[Path] = None) -> sqlite3.Connection:
+def initialize_db(project_path: Optional[str] = None, db_path: Optional[Path] = None) -> sqlite3.Connection:
     """Initialize the database schema if not already done."""
     path = db_path or get_db_path(project_path)
     conn = get_connection(path)
@@ -230,6 +230,24 @@ def delete_project(project_path: str, db_path: Optional[Path] = None) -> None:
     if project_id:
         conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
         conn.commit()
+
+
+def remove_project(project_path: str) -> None:
+    """Remove a project record and delete its per-project DB file."""
+    db_path = get_project_db_path(project_path)
+    if db_path.exists():
+        try:
+            conn = get_connection(db_path)
+            project_id = get_project_id(project_path, db_path)
+            if project_id:
+                conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+                conn.commit()
+        except sqlite3.OperationalError:
+            pass
+        db_path.unlink()
+    proj_dir = db_path.parent
+    if proj_dir.exists() and not any(proj_dir.iterdir()):
+        proj_dir.rmdir()
 
 
 def _get_db_path_for_project(project_path: str, db_path: Optional[Path] = None) -> Path:
@@ -877,11 +895,9 @@ if __name__ == "__main__":
         migrate_from_mongodb()
 
     elif args.command == "status":
-        initialize_db()
         print(json.dumps(db_status(), indent=2))
 
     elif args.command == "query":
-        initialize_db()
         results = find_symbol(args.symbol)
         print(json.dumps(results, indent=2, default=str))
 

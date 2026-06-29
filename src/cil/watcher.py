@@ -67,7 +67,6 @@ class FileWatcher:
 
     def _do_reindex_sqlite(self):
         """Perform incremental re-index using SQLite."""
-        sqlite_db.initialize_db()
         previous_index = sqlite_db.load_index(self.project_path)
         if not previous_index:
             print(f"No index for {self.project_path}, skipping watch re-index")

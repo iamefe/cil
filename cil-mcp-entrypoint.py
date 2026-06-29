@@ -8,5 +8,5 @@ os.chdir("/Users/iamefe/Documents/projects/cil")
 from cil.mcp.server import create_mcp_server
 
 if __name__ == "__main__":
-    server = create_mcp_server()
+    server = create_mcp_server(use_sqlite=True)
     server()
