@@ -5,6 +5,7 @@ import time
 from cil.database import get_collection
 from cil.indexer import Indexer
 from cil.models import CILIndex
+from cil import sqlite_db
 
 DEBOUNCE_SECONDS = 2
 
@@ -12,9 +13,10 @@ DEBOUNCE_SECONDS = 2
 class FileWatcher:
     """Watch a project directory for file changes and re-index incrementally."""
 
-    def __init__(self, project_path: str, enrich: bool = False):
+    def __init__(self, project_path: str, enrich: bool = False, use_sqlite: bool = False):
         self.project_path = os.path.abspath(project_path)
         self.enrich = enrich
+        self.use_sqlite = use_sqlite
         self.running = False
         self._timer = None
         self._lock = threading.Lock()
@@ -58,6 +60,32 @@ class FileWatcher:
 
     def _do_reindex(self):
         """Perform incremental re-index."""
+        if self.use_sqlite:
+            self._do_reindex_sqlite()
+        else:
+            self._do_reindex_mongodb()
+
+    def _do_reindex_sqlite(self):
+        """Perform incremental re-index using SQLite."""
+        sqlite_db.initialize_db()
+        previous_index = sqlite_db.load_index(self.project_path)
+        if not previous_index:
+            print(f"No index for {self.project_path}, skipping watch re-index")
+            return
+
+        indexer = Indexer()
+        cil_index = indexer.index_directory(
+            self.project_path,
+            enrich=self.enrich,
+            incremental=True,
+            previous_index=previous_index,
+        )
+
+        sqlite_db.store_index(cil_index)
+        print(f"Re-indexed {cil_index.project_path} ({len(cil_index.file_indices)} files)")
+
+    def _do_reindex_mongodb(self):
+        """Perform incremental re-index using MongoDB."""
         col = get_collection()
         doc = col.find_one({"project_path": self.project_path})
         if not doc:

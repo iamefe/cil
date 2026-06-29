@@ -1,12 +1,14 @@
 import json
 import sys
 import time
+import os
 
 from cil.database import get_collection, get_db
 from cil.indexer import Indexer
+from cil import sqlite_db
 
 
-def create_mcp_server():
+def create_mcp_server(use_sqlite=False):
     """Create an MCP server that wraps CIL endpoints as tools."""
 
     db_available_cache = {"ok": None, "ts": 0}
@@ -123,7 +125,7 @@ def create_mcp_server():
         },
         {
             "name": "cil_index_project",
-            "description": "Index a Python project directory. Stores results in MongoDB.",
+            "description": "Index a Python project directory. Stores results in MongoDB or SQLite depending on mode.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -236,12 +238,21 @@ def create_mcp_server():
     # --- Tool handlers ---
 
     def db_status():
+        if use_sqlite:
+            try:
+                sqlite_db.initialize_db()
+                return {"content": [{"type": "text", "text": json.dumps({"status": "ok", "backend": "sqlite", "db_path": sqlite_db.get_db_path()}, indent=2)}]}
+            except Exception as e:
+                return {"content": [{"type": "text", "text": json.dumps({"status": "error", "detail": str(e)}, indent=2)}], "isError": True}
         ok, err = _db_available()
         if ok:
-            return {"content": [{"type": "text", "text": json.dumps({"status": "ok"}, indent=2)}]}
+            return {"content": [{"type": "text", "text": json.dumps({"status": "ok", "backend": "mongodb"}, indent=2)}]}
         return {"content": [{"type": "text", "text": json.dumps({"status": "error", "detail": err}, indent=2)}], "isError": True}
 
     def find_symbol(name):
+        if use_sqlite:
+            results = sqlite_db.find_symbol(name)
+            return {"content": [{"type": "text", "text": json.dumps(results, indent=2, default=str)}]}
         ok, err = _db_available()
         if not ok:
             return _db_error_response(err)
@@ -256,6 +267,9 @@ def create_mcp_server():
         return {"content": [{"type": "text", "text": json.dumps(results, indent=2, default=str)}]}
 
     def trace_mutations(target):
+        if use_sqlite:
+            results = sqlite_db.trace_mutations(target)
+            return {"content": [{"type": "text", "text": json.dumps(results, indent=2, default=str)}]}
         ok, err = _db_available()
         if not ok:
             return _db_error_response(err)
@@ -268,6 +282,9 @@ def create_mcp_server():
         return {"content": [{"type": "text", "text": json.dumps(results, indent=2, default=str)}]}
 
     def trace_calls(func_name):
+        if use_sqlite:
+            results = sqlite_db.trace_calls(func_name)
+            return {"content": [{"type": "text", "text": json.dumps(results, indent=2, default=str)}]}
         ok, err = _db_available()
         if not ok:
             return _db_error_response(err)
@@ -283,6 +300,9 @@ def create_mcp_server():
         return {"content": [{"type": "text", "text": json.dumps({"callers": callers, "callees": callees}, indent=2, default=str)}]}
 
     def get_anomalies(severity=None):
+        if use_sqlite:
+            results = sqlite_db.get_anomalies(severity=severity)
+            return {"content": [{"type": "text", "text": json.dumps(results, indent=2, default=str)}]}
         ok, err = _db_available()
         if not ok:
             return _db_error_response(err)
@@ -315,16 +335,17 @@ def create_mcp_server():
             return {"content": [{"type": "text", "text": f"File not found: {file_path}"}], "isError": True}
 
     def index_project(project_path, enrich=False, incremental=False):
-        import os
         from cil.models import CILIndex
         if not os.path.isdir(project_path):
             return {"content": [{"type": "text", "text": f"Directory not found: {project_path}"}], "isError": True}
+
+        if use_sqlite:
+            return _index_project_sqlite(project_path, enrich, incremental)
 
         ok, err = _db_available()
         if not ok:
             return _db_error_response(err)
 
-        # Load previous index for incremental mode
         previous_index = None
         if incremental:
             col = get_collection()
@@ -354,9 +375,39 @@ def create_mcp_server():
             "symbol_count": sum(len(fi.symbols) for fi in cil_index.file_indices.values()),
             "enriched": enrich,
             "incremental": incremental,
-        }, indent=2)}]}  
+        }, indent=2)}]}
+
+    def _index_project_sqlite(project_path, enrich, incremental):
+        sqlite_db.initialize_db()
+        previous_index = None
+        if incremental:
+            previous_index = sqlite_db.load_index(project_path)
+
+        indexer = Indexer()
+        cil_index = indexer.index_directory(
+            project_path,
+            enrich=enrich,
+            incremental=incremental,
+            previous_index=previous_index,
+        )
+
+        sqlite_db.store_index(cil_index)
+
+        return {"content": [{"type": "text", "text": json.dumps({
+            "status": "indexed",
+            "project_path": cil_index.project_path,
+            "file_count": len(cil_index.file_indices),
+            "symbol_count": sum(len(fi.symbols) for fi in cil_index.file_indices.values()),
+            "enriched": enrich,
+            "incremental": incremental,
+        }, indent=2)}]}
 
     def file_summary(path):
+        if use_sqlite:
+            result = sqlite_db.get_file_summary(path)
+            if result is None:
+                return {"content": [{"type": "text", "text": f"File not found in index: {path}"}], "isError": True}
+            return {"content": [{"type": "text", "text": json.dumps(result, indent=2, default=str)}]}
         ok, err = _db_available()
         if not ok:
             return _db_error_response(err)
@@ -373,6 +424,9 @@ def create_mcp_server():
         return {"content": [{"type": "text", "text": f"File not found in index: {path}"}], "isError": True}
 
     def status():
+        if use_sqlite:
+            projects = sqlite_db.get_status()
+            return {"content": [{"type": "text", "text": json.dumps(projects, indent=2, default=str)}]}
         ok, err = _db_available()
         if not ok:
             return _db_error_response(err)
@@ -437,9 +491,3 @@ def create_mcp_server():
                 send_error(str(e), req_id)
 
     return run
-
-
-if __name__ == "__main__":
-    server = create_mcp_server()
-    server()
-

@@ -3,25 +3,35 @@ from flask import Flask, request, jsonify
 
 from cil.database import get_collection
 from cil.indexer import Indexer
+from cil import sqlite_db
 
 
-def create_app() -> Flask:
+def create_app(use_sqlite=False) -> Flask:
     app = Flask(__name__)
 
     @app.route("/cil/health", methods=["GET"])
     def cil_health():
-        """Health check — MongoDB connectivity."""
+        """Health check — MongoDB or SQLite connectivity."""
+        if use_sqlite:
+            try:
+                sqlite_db.initialize_db()
+                return jsonify({"status": "ok", "backend": "sqlite", "db_path": str(sqlite_db.get_db_path())})
+            except Exception as e:
+                return jsonify({"status": "error", "detail": str(e)}), 503
         from cil.database import get_db
         try:
             db = get_db()
             db.command("ping")
-            return jsonify({"status": "ok"})
+            return jsonify({"status": "ok", "backend": "mongodb"})
         except Exception as e:
             return jsonify({"status": "error", "detail": str(e)}), 503
 
     @app.route("/cil/status", methods=["GET"])
     def cil_status():
         """Return index freshness and stats."""
+        if use_sqlite:
+            projects = sqlite_db.get_status()
+            return jsonify(projects)
         col = get_collection()
         docs = list(col.find({}, {"project_path": 1, "indexed_at": 1, "version": 1, "_id": 0}))
 
@@ -46,10 +56,28 @@ def create_app() -> Flask:
         if not os.path.isdir(project_path):
             return jsonify({"error": f"Directory not found: {project_path}"}), 404
 
-        indexer = Indexer()
-        cil_index = indexer.index_directory(project_path)
+        enrich = data.get("enrich", False)
+        incremental = data.get("incremental", False)
 
-        # Upsert into MongoDB
+        if use_sqlite:
+            return _cil_index_sqlite(project_path, enrich, incremental)
+
+        from cil.models import CILIndex
+        previous_index = None
+        if incremental:
+            col = get_collection()
+            doc = col.find_one({"project_path": project_path})
+            if doc:
+                previous_index = CILIndex(**doc)
+
+        indexer = Indexer()
+        cil_index = indexer.index_directory(
+            project_path,
+            enrich=enrich,
+            incremental=incremental,
+            previous_index=previous_index,
+        )
+
         col = get_collection()
         col.replace_one(
             {"project_path": cil_index.project_path},
@@ -62,11 +90,42 @@ def create_app() -> Flask:
             "project_path": cil_index.project_path,
             "file_count": len(cil_index.file_indices),
             "symbol_count": sum(len(fi.symbols) for fi in cil_index.file_indices.values()),
+            "enriched": enrich,
+            "incremental": incremental,
+        })
+
+    def _cil_index_sqlite(project_path, enrich, incremental):
+        sqlite_db.initialize_db()
+        from cil.models import CILIndex
+        previous_index = None
+        if incremental:
+            previous_index = sqlite_db.load_index(project_path)
+
+        indexer = Indexer()
+        cil_index = indexer.index_directory(
+            project_path,
+            enrich=enrich,
+            incremental=incremental,
+            previous_index=previous_index,
+        )
+
+        sqlite_db.store_index(cil_index)
+
+        return jsonify({
+            "status": "indexed",
+            "project_path": cil_index.project_path,
+            "file_count": len(cil_index.file_indices),
+            "symbol_count": sum(len(fi.symbols) for fi in cil_index.file_indices.values()),
+            "enriched": enrich,
+            "incremental": incremental,
         })
 
     @app.route("/cil/symbol/<name>", methods=["GET"])
     def cil_symbol(name: str):
         """Find a symbol across all indexed files."""
+        if use_sqlite:
+            results = sqlite_db.find_symbol(name)
+            return jsonify(results)
         col = get_collection()
         results = []
 
@@ -82,6 +141,9 @@ def create_app() -> Flask:
     @app.route("/cil/mutations/<target>", methods=["GET"])
     def cil_mutations(target: str):
         """Trace all writes to a variable."""
+        if use_sqlite:
+            results = sqlite_db.trace_mutations(target)
+            return jsonify(results)
         col = get_collection()
         results = []
 
@@ -95,6 +157,9 @@ def create_app() -> Flask:
     @app.route("/cil/calls/<func_name>", methods=["GET"])
     def cil_calls(func_name: str):
         """Find callers and callees for a function."""
+        if use_sqlite:
+            results = sqlite_db.trace_calls(func_name)
+            return jsonify(results)
         col = get_collection()
         callers = []
         callees = []
@@ -135,6 +200,11 @@ def create_app() -> Flask:
     @app.route("/cil/file/<path:path>", methods=["GET"])
     def cil_file(path: str):
         """Get file-level summary and symbol list."""
+        if use_sqlite:
+            result = sqlite_db.get_file_summary(path)
+            if result is None:
+                return jsonify({"error": f"File not found in index: {path}"}), 404
+            return jsonify(result)
         col = get_collection()
 
         for doc in col.find({}, {"file_indices": 1, "_id": 0}):
@@ -154,6 +224,9 @@ def create_app() -> Flask:
     def cil_anomalies():
         """Return all detected anomalies."""
         severity = request.args.get("severity")
+        if use_sqlite:
+            results = sqlite_db.get_anomalies(severity=severity)
+            return jsonify(results)
         col = get_collection()
         results = []
 
@@ -166,5 +239,3 @@ def create_app() -> Flask:
         return jsonify(results)
 
     return app
-
-
