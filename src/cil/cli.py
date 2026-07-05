@@ -64,6 +64,14 @@ def main():
     sqlite_query.add_argument("symbol", help="Symbol name to find")
     sqlite_remove = sqlite_sub.add_parser("remove", help="Remove a project from SQLite")
     sqlite_remove.add_argument("project_path", help="Path to the project directory")
+    sqlite_sub.add_parser("prune", help="Remove invalid paths from watch database")
+    sqlite_prune_index = sqlite_sub.add_parser("prune-index", help="Permanently delete inactive rows from index tables")
+    sqlite_prune_index.add_argument("project_path", help="Path to the project directory")
+
+    # Watch-all: watch all registered paths from the watch database
+    watch_all_parser = subparsers.add_parser("watch-all", help="Watch all registered paths from watch database")
+    watch_all_parser.add_argument("--enrich", action="store_true", help="Enable LLM semantic enrichment")
+    watch_all_parser.add_argument("--sqlite", action="store_true", help="Use SQLite instead of MongoDB")
 
     args = parser.parse_args()
 
@@ -104,9 +112,54 @@ def main():
             _anomalies_mongodb(args)
 
     elif args.command == "watch":
+        project_path = os.path.abspath(args.project_path)
+
+        # Validate path exists
+        if not os.path.exists(project_path):
+            print(f"Error: Path does not exist: {project_path}")
+            sys.exit(1)
+
+        # Register and validate in watch database
+        sqlite_db.register_watched_path(project_path)
+
         from cil.watcher import FileWatcher
-        watcher = FileWatcher(args.project_path, enrich=args.enrich, use_sqlite=args.sqlite)
+        watcher = FileWatcher(project_path, enrich=args.enrich, use_sqlite=args.sqlite)
         watcher.start()
+
+    elif args.command == "watch-all":
+        invalid = sqlite_db.validate_all_paths()
+        if invalid:
+            print(f"Warning: {len(invalid)} invalid path(s) found:")
+            for p in invalid:
+                print(f"  - {p}")
+            print("Run 'cil sqlite prune' to remove invalid paths.\n")
+
+        valid_paths = sqlite_db.get_valid_paths()
+        if not valid_paths:
+            print("No valid paths to watch. Register paths with 'cil watch <path>'.")
+            sys.exit(1)
+
+        print(f"Watching {len(valid_paths)} path(s):\n")
+        for p in valid_paths:
+            print(f"  - {p}")
+        print()
+
+        from cil.watcher import FileWatcher
+        import threading
+
+        watchers = []
+        for path in valid_paths:
+            watcher = FileWatcher(path, enrich=args.enrich, use_sqlite=args.sqlite)
+            t = threading.Thread(target=watcher.start, daemon=True)
+            t.start()
+            watchers.append((watcher, t))
+
+        try:
+            for watcher, t in watchers:
+                t.join()
+        except KeyboardInterrupt:
+            for watcher, _ in watchers:
+                watcher.stop()
 
     elif args.command == "remove":
         sqlite_db.remove_project(args.project_path)
@@ -149,6 +202,7 @@ def _index_sqlite(args):
     )
 
     sqlite_db.store_index(cil_index)
+    sqlite_db.register_watched_path(project_path)
 
     print(f"Indexed {cil_index.project_path}")
     print(f"  Files: {len(cil_index.file_indices)}")
@@ -374,8 +428,21 @@ def _sqlite_command(args):
         sqlite_db.remove_project(args.project_path)
         print(f"Removed project: {args.project_path}")
 
+    elif args.sqlite_command == "prune":
+        pruned = sqlite_db.prune_invalid_paths()
+        if pruned:
+            print(f"Pruned {len(pruned)} invalid path(s):")
+            for p in pruned:
+                print(f"  - {p}")
+        else:
+            print("No invalid paths to prune.")
+
+    elif args.sqlite_command == "prune-index":
+        deleted = sqlite_db.prune_inactive_rows(args.project_path)
+        print(f"Pruned {deleted} inactive row(s) from index tables.")
+
     else:
-        print("Unknown SQLite command. Use: init, migrate, query, remove")
+        print("Unknown SQLite command. Use: init, migrate, query, remove, prune, prune-index")
 
 
 if __name__ == "__main__":

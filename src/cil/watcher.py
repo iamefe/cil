@@ -23,6 +23,17 @@ class FileWatcher:
 
     def start(self):
         """Start watching for file changes."""
+        # Validate path exists
+        if not os.path.exists(self.project_path):
+            print(f"Error: Path does not exist: {self.project_path}")
+            sqlite_db.mark_path_invalid(self.project_path, "Path does not exist")
+            return
+
+        # Validate in watch database
+        if not sqlite_db.is_path_valid(self.project_path):
+            print(f"Error: Path is not valid in watch database: {self.project_path}")
+            return
+
         try:
             from watchdog.observers import Observer
             from watchdog.events import FileSystemEventHandler

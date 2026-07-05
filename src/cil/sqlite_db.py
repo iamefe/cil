@@ -9,7 +9,7 @@ from typing import Optional
 PROJECTS_DIR = Path.home() / ".cil" / "projects"
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 
 CREATE_TABLES_SQL = """
@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS files (
     file_path TEXT NOT NULL,
     file_hash TEXT DEFAULT '',
     indexed_at TIMESTAMP NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
     UNIQUE(project_id, file_path)
 );
@@ -50,6 +51,7 @@ CREATE TABLE IF NOT EXISTS symbols (
     risk_flags TEXT DEFAULT '[]',
     complexity TEXT DEFAULT '',
     audit_notes TEXT DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
     FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
 );
 
@@ -57,6 +59,7 @@ CREATE TABLE IF NOT EXISTS imports (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     file_id INTEGER NOT NULL,
     import_path TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
     FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
 );
 
@@ -66,6 +69,7 @@ CREATE TABLE IF NOT EXISTS call_graph (
     caller TEXT NOT NULL,
     callee TEXT NOT NULL,
     line INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
 );
 
@@ -76,6 +80,7 @@ CREATE TABLE IF NOT EXISTS mutations (
     source TEXT NOT NULL,
     line INTEGER NOT NULL,
     kind TEXT DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
 );
 
@@ -87,6 +92,7 @@ CREATE TABLE IF NOT EXISTS anomalies (
     file_path TEXT NOT NULL,
     line INTEGER NOT NULL,
     message TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
 );
 
@@ -98,6 +104,14 @@ CREATE INDEX IF NOT EXISTS idx_mutations_target ON mutations(target);
 CREATE INDEX IF NOT EXISTS idx_anomalies_severity ON anomalies(severity);
 CREATE INDEX IF NOT EXISTS idx_anomalies_type ON anomalies(type);
 CREATE INDEX IF NOT EXISTS idx_files_project ON files(project_id);
+
+CREATE TABLE IF NOT EXISTS watched_paths (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    path TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'valid',
+    invalid_reason TEXT DEFAULT '',
+    last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
@@ -166,7 +180,59 @@ def initialize_db(project_path: Optional[str] = None, db_path: Optional[Path] = 
         conn.execute("INSERT INTO schema_migrations (version) VALUES (?)", (SCHEMA_VERSION,))
         conn.commit()
 
+    # Migrate from v1 to v2: add watched_paths table
+    _migrate_v1_to_v2(conn)
+
+    # Migrate from v2 to v3: add status column to index tables
+    _migrate_v2_to_v3(conn)
+
     return conn
+
+
+def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+    """Migrate from schema v1 to v2: add watched_paths table."""
+    cursor = conn.execute("SELECT version FROM schema_migrations WHERE version = 1")
+    if not cursor.fetchone():
+        return  # Already at v2 or newer
+
+    # Check if watched_paths already exists
+    cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='watched_paths'")
+    if cursor.fetchone():
+        return  # Table already exists
+
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS watched_paths (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL DEFAULT 'valid',
+            invalid_reason TEXT DEFAULT '',
+            last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    conn.execute("INSERT INTO schema_migrations (version) VALUES (?)", (2,))
+    conn.commit()
+
+
+def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
+    """Migrate from schema v2 to v3: add status column to index tables."""
+    cursor = conn.execute("SELECT version FROM schema_migrations WHERE version = 2")
+    if not cursor.fetchone():
+        return  # Already at v3 or newer
+
+    cursor = conn.execute("SELECT version FROM schema_migrations WHERE version = 3")
+    if cursor.fetchone():
+        return  # Already migrated
+
+    conn.executescript("""
+        ALTER TABLE files ADD COLUMN status TEXT NOT NULL DEFAULT 'active';
+        ALTER TABLE symbols ADD COLUMN status TEXT NOT NULL DEFAULT 'active';
+        ALTER TABLE imports ADD COLUMN status TEXT NOT NULL DEFAULT 'active';
+        ALTER TABLE call_graph ADD COLUMN status TEXT NOT NULL DEFAULT 'active';
+        ALTER TABLE mutations ADD COLUMN status TEXT NOT NULL DEFAULT 'active';
+        ALTER TABLE anomalies ADD COLUMN status TEXT NOT NULL DEFAULT 'active';
+    """)
+    conn.execute("INSERT INTO schema_migrations (version) VALUES (?)", (3,))
+    conn.commit()
 
 
 def drop_all(project_path: str, db_path: Optional[Path] = None) -> None:
@@ -291,11 +357,12 @@ def upsert_file(project_id: int, file_path: str, file_hash: str, project_path: s
     conn = get_connection(path)
     conn.execute(
         """
-        INSERT INTO files (project_id, file_path, file_hash, indexed_at)
-        VALUES (?, ?, ?, datetime('now'))
+        INSERT INTO files (project_id, file_path, file_hash, indexed_at, status)
+        VALUES (?, ?, ?, datetime('now'), 'active')
         ON CONFLICT(project_id, file_path) DO UPDATE SET
             file_hash = excluded.file_hash,
-            indexed_at = datetime('now')
+            indexed_at = datetime('now'),
+            status = 'active'
         """,
         (project_id, file_path, file_hash),
     )
@@ -387,20 +454,41 @@ def insert_anomalies(project_id: int, anomalies: list[dict], project_path: str, 
 
 
 def clear_project_data(project_id: int, project_path: str, db_path: Optional[Path] = None) -> None:
-    """Clear all data for a project (except the project record itself)."""
+    """Deactivate all data for a project (except the project record itself)."""
     path = _get_db_path_for_project(project_path, db_path)
     conn = get_connection(path)
-    conn.execute("DELETE FROM anomalies WHERE project_id = ?", (project_id,))
-    conn.execute("DELETE FROM mutations WHERE project_id = ?", (project_id,))
-    conn.execute("DELETE FROM call_graph WHERE project_id = ?", (project_id,))
+    conn.execute("UPDATE anomalies SET status = 'invalid' WHERE project_id = ?", (project_id,))
+    conn.execute("UPDATE mutations SET status = 'invalid' WHERE project_id = ?", (project_id,))
+    conn.execute("UPDATE call_graph SET status = 'invalid' WHERE project_id = ?", (project_id,))
 
-    # Delete symbols, imports, and files via project_id
+    # Deactivate symbols, imports, and files via project_id
     file_ids = [row["id"] for row in conn.execute("SELECT id FROM files WHERE project_id = ?", (project_id,)).fetchall()]
     for fid in file_ids:
-        conn.execute("DELETE FROM symbols WHERE file_id = ?", (fid,))
-        conn.execute("DELETE FROM imports WHERE file_id = ?", (fid,))
-    conn.execute("DELETE FROM files WHERE project_id = ?", (project_id,))
+        conn.execute("UPDATE symbols SET status = 'invalid' WHERE file_id = ?", (fid,))
+        conn.execute("UPDATE imports SET status = 'invalid' WHERE file_id = ?", (fid,))
+    conn.execute("UPDATE files SET status = 'invalid' WHERE project_id = ?", (project_id,))
     conn.commit()
+
+
+def prune_inactive_rows(project_path: str, db_path: Optional[Path] = None) -> int:
+    """Permanently delete rows with status='invalid'. Returns number of rows deleted."""
+    path = _get_db_path_for_project(project_path, db_path)
+    conn = get_connection(path)
+    total = 0
+
+    # Count and delete from each table
+    for table in ["anomalies", "mutations", "call_graph", "symbols", "imports", "files"]:
+        try:
+            cursor = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE status = 'invalid'")
+            count = cursor.fetchone()[0]
+            total += count
+            conn.execute(f"DELETE FROM {table} WHERE status = 'invalid'")
+        except sqlite3.OperationalError:
+            # Table doesn't have status column (pre-v3 schema), skip
+            pass
+
+    conn.commit()
+    return total
 
 
 def _find_symbol_in_db(name: str, db_path: Path) -> list[dict]:
@@ -647,8 +735,8 @@ def get_status(project_path: Optional[str] = None, db_path: Optional[Path] = Non
                    COUNT(DISTINCT f.id) as file_count,
                    COUNT(DISTINCT s.id) as symbol_count
             FROM projects p
-            LEFT JOIN files f ON p.id = f.project_id
-            LEFT JOIN symbols s ON f.id = s.file_id
+            LEFT JOIN files f ON p.id = f.project_id AND f.status = 'active'
+            LEFT JOIN symbols s ON f.id = s.file_id AND s.status = 'active'
             GROUP BY p.id
             """
         )
@@ -663,8 +751,8 @@ def get_status(project_path: Optional[str] = None, db_path: Optional[Path] = Non
                    COUNT(DISTINCT f.id) as file_count,
                    COUNT(DISTINCT s.id) as symbol_count
             FROM projects p
-            LEFT JOIN files f ON p.id = f.project_id
-            LEFT JOIN symbols s ON f.id = s.file_id
+            LEFT JOIN files f ON p.id = f.project_id AND f.status = 'active'
+            LEFT JOIN symbols s ON f.id = s.file_id AND s.status = 'active'
             GROUP BY p.id
             """
         )
@@ -679,8 +767,8 @@ def get_status(project_path: Optional[str] = None, db_path: Optional[Path] = Non
                    COUNT(DISTINCT f.id) as file_count,
                    COUNT(DISTINCT s.id) as symbol_count
             FROM projects p
-            LEFT JOIN files f ON p.id = f.project_id
-            LEFT JOIN symbols s ON f.id = s.file_id
+            LEFT JOIN files f ON p.id = f.project_id AND f.status = 'active'
+            LEFT JOIN symbols s ON f.id = s.file_id AND s.status = 'active'
             GROUP BY p.id
             """
         )
@@ -693,7 +781,7 @@ def get_file_hash(project_id: int, file_path: str, project_path: str, db_path: O
     path = _get_db_path_for_project(project_path, db_path)
     conn = get_connection(path)
     cursor = conn.execute(
-        "SELECT file_hash FROM files WHERE project_id = ? AND file_path = ?",
+        "SELECT file_hash FROM files WHERE project_id = ? AND file_path = ? AND status = 'active'",
         (project_id, file_path),
     )
     row = cursor.fetchone()
@@ -705,7 +793,7 @@ def get_project_file_hashes(project_id: int, project_path: str, db_path: Optiona
     path = _get_db_path_for_project(project_path, db_path)
     conn = get_connection(path)
     cursor = conn.execute(
-        "SELECT file_path, file_hash FROM files WHERE project_id = ?",
+        "SELECT file_path, file_hash FROM files WHERE project_id = ? AND status = 'active'",
         (project_id,),
     )
     return {row["file_path"]: row["file_hash"] for row in cursor.fetchall()}
@@ -771,7 +859,7 @@ def load_index(project_path: str, db_path: Optional[Path] = None) -> Optional["C
     # Load files with symbols and imports
     file_indices = {}
     file_cursor = conn.execute(
-        "SELECT id, file_path, file_hash, indexed_at FROM files WHERE project_id = ?",
+        "SELECT id, file_path, file_hash, indexed_at FROM files WHERE project_id = ? AND status = 'active'",
         (project_id,),
     )
     for frow in file_cursor.fetchall():
@@ -779,7 +867,7 @@ def load_index(project_path: str, db_path: Optional[Path] = None) -> Optional["C
 
         # Load symbols
         sym_cursor = conn.execute(
-            "SELECT name, kind, line_start, line_end, signature, docstring, decorators, purpose, risk_flags, complexity, audit_notes FROM symbols WHERE file_id = ?",
+            "SELECT name, kind, line_start, line_end, signature, docstring, decorators, purpose, risk_flags, complexity, audit_notes FROM symbols WHERE file_id = ? AND status = 'active'",
             (fid,),
         )
         symbols = []
@@ -801,7 +889,7 @@ def load_index(project_path: str, db_path: Optional[Path] = None) -> Optional["C
 
         # Load imports
         imp_cursor = conn.execute(
-            "SELECT import_path FROM imports WHERE file_id = ?",
+            "SELECT import_path FROM imports WHERE file_id = ? AND status = 'active'",
             (fid,),
         )
         imports = [irow["import_path"] for irow in imp_cursor.fetchall()]
@@ -816,21 +904,21 @@ def load_index(project_path: str, db_path: Optional[Path] = None) -> Optional["C
 
     # Load call graph
     call_cursor = conn.execute(
-        "SELECT caller, callee, line FROM call_graph WHERE project_id = ?",
+        "SELECT caller, callee, line FROM call_graph WHERE project_id = ? AND status = 'active'",
         (project_id,),
     )
     call_graph = [CallEdge(caller=r["caller"], callee=r["callee"], line=r["line"]) for r in call_cursor.fetchall()]
 
     # Load mutations
     mut_cursor = conn.execute(
-        "SELECT target, source, line, kind FROM mutations WHERE project_id = ?",
+        "SELECT target, source, line, kind FROM mutations WHERE project_id = ? AND status = 'active'",
         (project_id,),
     )
     mutations = [MutationInfo(target=r["target"], source=r["source"], line=r["line"], kind=r["kind"]) for r in mut_cursor.fetchall()]
 
     # Load anomalies
     anom_cursor = conn.execute(
-        "SELECT type, severity, file_path, line, message FROM anomalies WHERE project_id = ?",
+        "SELECT type, severity, file_path, line, message FROM anomalies WHERE project_id = ? AND status = 'active'",
         (project_id,),
     )
     anomalies = [Anomaly(type=r["type"], severity=r["severity"], file_path=r["file_path"], line=r["line"], message=r["message"]) for r in anom_cursor.fetchall()]
@@ -863,6 +951,137 @@ def migrate_from_mongodb(project_path: Optional[str] = None, db_path: Optional[P
         print(f"Migrated: {cil_index.project_path} ({len(cil_index.file_indices)} files)")
 
     print("Migration complete.")
+
+
+# Watch database functions — uses a global DB at ~/.cil/watch.db
+
+WATCH_DB_PATH = Path.home() / ".cil" / "watch.db"
+
+WATCH_CREATE_SQL = """
+CREATE TABLE IF NOT EXISTS watched_paths (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    path TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'valid',
+    invalid_reason TEXT DEFAULT '',
+    last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+def _get_watch_db() -> Path:
+    """Get the global watch database path."""
+    return WATCH_DB_PATH
+
+def _init_watch_db() -> None:
+    """Initialize the watch database if it doesn't exist."""
+    conn = get_connection(_get_watch_db())
+    conn.executescript(WATCH_CREATE_SQL)
+    conn.close()
+
+def register_watched_path(path: str) -> None:
+    """Register a path in the watched_paths table."""
+    _init_watch_db()
+    conn = get_connection(_get_watch_db())
+    conn.execute(
+        "INSERT OR REPLACE INTO watched_paths (path, status, invalid_reason, last_checked) VALUES (?, 'valid', '', CURRENT_TIMESTAMP)",
+        (path,)
+    )
+    conn.commit()
+    conn.close()
+
+def unregister_watched_path(path: str) -> None:
+    """Remove a path from the watched_paths table."""
+    _init_watch_db()
+    conn = get_connection(_get_watch_db())
+    conn.execute("DELETE FROM watched_paths WHERE path = ?", (path,))
+    conn.commit()
+    conn.close()
+
+def is_path_watched(path: str) -> bool:
+    """Check if a path is registered in the watched_paths table."""
+    _init_watch_db()
+    conn = get_connection(_get_watch_db())
+    cursor = conn.execute("SELECT 1 FROM watched_paths WHERE path = ?", (path,))
+    result = cursor.fetchone() is not None
+    conn.close()
+    return result
+
+def is_path_valid(path: str) -> bool:
+    """Check if a path is registered and valid in the watched_paths table."""
+    _init_watch_db()
+    conn = get_connection(_get_watch_db())
+    cursor = conn.execute("SELECT status FROM watched_paths WHERE path = ?", (path,))
+    row = cursor.fetchone()
+    conn.close()
+    return row is not None and row["status"] == "valid"
+
+def mark_path_invalid(path: str, reason: str = "") -> None:
+    """Mark a path as invalid in the watched_paths table."""
+    _init_watch_db()
+    conn = get_connection(_get_watch_db())
+    conn.execute(
+        "UPDATE watched_paths SET status = 'invalid', invalid_reason = ?, last_checked = CURRENT_TIMESTAMP WHERE path = ?",
+        (reason, path)
+    )
+    conn.commit()
+    conn.close()
+
+def validate_all_paths() -> list[str]:
+    """Validate all watched paths. Returns list of invalid paths."""
+    _init_watch_db()
+    conn = get_connection(_get_watch_db())
+    cursor = conn.execute("SELECT path FROM watched_paths")
+    invalid = []
+    for row in cursor:
+        p = row["path"]
+        if not os.path.exists(p):
+            mark_path_invalid(p, "Path does not exist")
+            invalid.append(p)
+        else:
+            conn.execute(
+                "UPDATE watched_paths SET status = 'valid', invalid_reason = '', last_checked = CURRENT_TIMESTAMP WHERE path = ?",
+                (p,)
+            )
+    conn.commit()
+    conn.close()
+    return invalid
+
+def get_invalid_paths() -> list[tuple[str, str]]:
+    """Get all invalid paths and their reasons."""
+    _init_watch_db()
+    conn = get_connection(_get_watch_db())
+    cursor = conn.execute("SELECT path, invalid_reason FROM watched_paths WHERE status = 'invalid'")
+    result = [(row["path"], row["invalid_reason"]) for row in cursor.fetchall()]
+    conn.close()
+    return result
+
+def get_watched_paths() -> list[str]:
+    """Get all watched paths regardless of status."""
+    _init_watch_db()
+    conn = get_connection(_get_watch_db())
+    cursor = conn.execute("SELECT path FROM watched_paths")
+    result = [row["path"] for row in cursor.fetchall()]
+    conn.close()
+    return result
+
+def get_valid_paths() -> list[str]:
+    """Get all valid watched paths."""
+    _init_watch_db()
+    conn = get_connection(_get_watch_db())
+    cursor = conn.execute("SELECT path FROM watched_paths WHERE status = 'valid'")
+    result = [row["path"] for row in cursor.fetchall()]
+    conn.close()
+    return result
+
+def prune_invalid_paths() -> list[str]:
+    """Remove all invalid paths from the watched_paths table. Returns list of pruned paths."""
+    _init_watch_db()
+    conn = get_connection(_get_watch_db())
+    cursor = conn.execute("SELECT path FROM watched_paths WHERE status = 'invalid'")
+    pruned = [row["path"] for row in cursor.fetchall()]
+    conn.execute("DELETE FROM watched_paths WHERE status = 'invalid'")
+    conn.commit()
+    conn.close()
+    return pruned
 
 
 if __name__ == "__main__":

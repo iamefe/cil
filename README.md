@@ -178,6 +178,19 @@ cil watch /path/to/project --sqlite
 cil watch /path/to/project --sqlite --enrich
 ```
 
+### `cil watch-all`
+
+Watch all registered paths from the watch database. Validates paths on startup, skips invalid ones, and starts a watcher thread for each valid path. Use with launchd to auto-start at boot.
+
+| Flag | Description |
+|---|---|
+| `--sqlite` | Use SQLite storage (default is MongoDB) |
+| `--enrich` | Run LLM semantic enrichment on re-index |
+
+```bash
+cil watch-all --sqlite
+```
+
 ### `cil remove <project_path>`
 
 Remove a project from the SQLite index (deletes project record and per-project DB file).
@@ -245,6 +258,26 @@ cil sqlite query "updateStatus"
 #### `cil sqlite remove <project_path>`
 
 Remove a project from SQLite (same as `cil remove`).
+
+#### `cil sqlite prune`
+
+Remove invalid paths from the watch database.
+
+```bash
+cil sqlite prune
+# Pruned 2 invalid path(s):
+#   - /old/path
+#   - /another/old/path
+```
+
+### `cil prune-index <project_path>`
+
+Permanently delete soft-deleted rows (`status = 'invalid'`) from a project's index. After reindexing, old rows are marked invalid instead of deleted. Use this to reclaim space after confirming the new index is correct.
+
+```bash
+cil prune-index /path/to/project
+# Pruned 150 invalid rows from /path/to/project
+```
 
 ```bash
 cil sqlite remove /path/to/project
@@ -504,3 +537,122 @@ cil_get_body("src/config.py", 10, 25)
 - [x] Flask API server — HTTP access to all index operations
 - [x] Project removal — clean up indexed projects (`cil remove`)
 - [x] MongoDB migration — migrate existing data to SQLite (`cil sqlite migrate`)
+- [x] Watch database — track registered paths, validate, prune invalid (`cil sqlite prune`)
+- [x] Watch-all mode — watch all registered paths (`cil watch-all`)
+- [x] Launchd integration — auto-start watchers at boot (see `com.cil.watch-all.plist`)
+- [x] Soft-delete pattern — `status` column in all index tables, `clear_project_data` marks rows invalid instead of deleting
+- [x] Schema v3 — `status` column in all index tables for soft-delete support
+- [x] Prune-index — permanently delete soft-deleted rows after reindexing
+
+## Launchd Integration
+
+Auto-start CIL watchers at macOS boot using the provided launchd plist.
+
+### Setup
+
+1. Copy the plist to your LaunchAgents directory:
+
+```bash
+cp com.cil.watch-all.plist ~/Library/LaunchAgents/
+```
+
+2. Load the agent:
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.cil.watch-all.plist
+```
+
+3. Verify it's running:
+
+```bash
+launchctl list | grep cil
+# Output: -    0    com.cil.watch-all
+```
+
+### Unload
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.cil.watch-all.plist
+```
+
+### Logs
+
+```bash
+tail -f /tmp/cil-watch-all.log
+```
+
+### How It Works
+
+1. Register paths with `cil watch <path>` (or `cil add <path> --sqlite`)
+2. Paths are stored in `~/.cil/watch.db`
+3. `cil watch-all` reads all valid paths and starts a watcher for each
+4. launchd runs `cil watch-all` at boot and keeps it alive
+
+### CIL MCP Server
+
+Auto-start the CIL MCP server at boot for agent integration.
+
+#### Setup
+
+1. Copy the plist to your LaunchAgents directory:
+
+```bash
+cp com.cil.mcp.plist ~/Library/LaunchAgents/
+```
+
+2. Load the agent:
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.cil.mcp.plist
+```
+
+3. Verify it's running:
+
+```bash
+launchctl list | grep cil
+# Output: -    0    com.cil.mcp
+```
+
+#### Unload
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.cil.mcp.plist
+```
+
+#### Logs
+
+```bash
+tail -f /tmp/cil-mcp.log
+```
+
+#### How It Works
+
+1. The MCP server runs `cil-mcp-entrypoint.py` with SQLite enabled
+2. It exposes 9 tools to any MCP-compatible agent
+3. launchd keeps the server alive and restarts it on crash
+
+## Soft-Delete Pattern
+
+CIL uses a soft-delete pattern to protect against accidental data loss during reindexing. Instead of permanently deleting rows, old rows are marked with `status = 'invalid'`.
+
+### How It Works
+
+1. **Reindexing** — when a project is reindexed, `clear_project_data()` sets `status = 'invalid'` on all existing rows instead of deleting them
+2. **Active queries** — all query methods filter by `status = 'active'`, so invalid rows are invisible to normal operations
+3. **Upsert recovery** — if `upsert_file` is called on a previously invalidated file, the `status` is reset to `'active'`, restoring the row
+4. **Pruning** — after confirming the new index is correct, use `cil prune-index <project_path>` to permanently delete invalid rows and reclaim space
+
+### Schema v3
+
+Schema version 3 adds a `status` column to all index tables:
+
+| Table | Status Column | Default |
+|---|---|---|
+| `files` | `status` | `'active'` |
+| `symbols` | `status` | `'active'` |
+| `imports` | `status` | `'active'` |
+| `call_graph` | `status` | `'active'` |
+| `mutations` | `status` | `'active'` |
+| `anomalies` | `status` | `'active'` |
+
+The migration is applied automatically on first access after the schema version check.
