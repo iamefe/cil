@@ -8,3 +8,4 @@ __pycache__/
 .cil.db
 .trash/
 *.mobius.db
+mobius.db
