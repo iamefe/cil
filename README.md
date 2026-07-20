@@ -152,13 +152,11 @@ CIL runs language-native static analysis during indexing — no LLM required. Ea
 ## Installation
 
 ```bash
-# Clone and install (editable mode recommended for development)
-git clone https://github.com/your-org/cil.git
-cd cil
-pip install -e .
+# Install from GitHub
+pip install git+https://github.com/iamefe/cil.git
 
-# Or install directly
-pip install cil
+# Or clone and install in editable mode for development
+git clone https://github.com/iamefe/cil.git && cd cil && pip install -e .
 ```
 
 ### Environment Setup
