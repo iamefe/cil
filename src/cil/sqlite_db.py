@@ -1,5 +1,6 @@
 import sqlite3
 import json
+import logging
 import os
 from pathlib import Path
 from datetime import datetime
@@ -155,6 +156,49 @@ def get_db_path(project_path: Optional[str] = None) -> Path:
     raise ValueError("project_path is required when CIL_SQLITE_DB is not set")
 
 
+_logger = logging.getLogger(__name__)
+
+
+def _harden_permissions(db_path: Path) -> None:
+    """Restrict file and directory permissions on SQLite database paths.
+
+    Sets the DB file itself to 0o600 (owner read/write only) and walks up
+    through parent directories restricting each to 0o700 (owner access only).
+    Stops at ~ or any directory outside ~/.cil/. Failures are logged as warnings
+    but never raise — they must not crash indexing.
+    """
+    # Harden the DB file itself
+    if db_path.exists():
+        try:
+            os.chmod(str(db_path), 0o600)
+        except OSError as e:
+            _logger.warning("Failed to chmod %s to 0600: %s", db_path, e)
+
+    # Harden WAL and SHM sidecar files if present
+    for suffix in ("-wal.db-wal", "-wal.db-shm"):
+        sidecar = db_path.parent / (db_path.name + suffix)
+        if sidecar.exists():
+            try:
+                os.chmod(str(sidecar), 0o600)
+            except OSError as e:
+                _logger.warning("Failed to chmod %s to 0600: %s", sidecar, e)
+
+    # Walk up from the DB's parent directory toward ~/.cil/ and restrict each
+    cil_dir = Path.home() / ".cil"
+    current = db_path.parent
+    while current.is_relative_to(cil_dir):
+        try:
+            st = current.stat()
+            # Only tighten — never loosen — permissions
+            current_mode = st.st_mode & 0o777
+            new_mode = current_mode & 0o700
+            if current_mode != new_mode:
+                os.chmod(str(current), new_mode)
+        except OSError as e:
+            _logger.warning("Failed to chmod %s: %s", current, e)
+        current = current.parent
+
+
 def get_connection(db_path: Optional[Path] = None) -> sqlite3.Connection:
     """Get a SQLite connection with row factory."""
     if db_path is None:
@@ -165,6 +209,7 @@ def get_connection(db_path: Optional[Path] = None) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    _harden_permissions(path)
     return conn
 
 

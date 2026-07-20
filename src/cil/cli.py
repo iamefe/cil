@@ -20,32 +20,32 @@ def main():
     index_parser.add_argument("--enrich", action="store_true", help="Run LLM semantic enrichment")
     index_parser.add_argument("--force", action="store_true", help="Clear old index before re-indexing")
     index_parser.add_argument("--incremental", action="store_true", help="Only re-index changed files")
-    index_parser.add_argument("--sqlite", action="store_true", help="Use SQLite instead of MongoDB")
+    index_parser.add_argument("--mongo", action="store_true", help="Use MongoDB instead of SQLite")
 
     # Status command
     status_parser = subparsers.add_parser("status", help="Show index status")
-    status_parser.add_argument("--sqlite", action="store_true", help="Use SQLite instead of MongoDB")
+    status_parser.add_argument("--mongo", action="store_true", help="Use MongoDB instead of SQLite")
 
     # Query command
     query_parser = subparsers.add_parser("query", help="Query the index")
     query_parser.add_argument("symbol", help="Symbol name to find")
-    query_parser.add_argument("--sqlite", action="store_true", help="Use SQLite instead of MongoDB")
+    query_parser.add_argument("--mongo", action="store_true", help="Use MongoDB instead of SQLite")
 
     # MCP server command
     serve_parser = subparsers.add_parser("serve", help="Start MCP server")
-    serve_parser.add_argument("--sqlite", action="store_true", help="Use SQLite instead of MongoDB")
+    serve_parser.add_argument("--mongo", action="store_true", help="Use MongoDB instead of SQLite")
 
     # Anomalies command
-    anom_parser = subparsers.add_parser("anomalies", help="List detected anomalies")
+    anom_parser = subparsers.add_parser("anomalies", help="List detected anomalies (Python files only)")
     anom_parser.add_argument("--severity", choices=["low", "medium", "high"], help="Filter by severity")
     anom_parser.add_argument("--file", help="Filter by file path")
-    anom_parser.add_argument("--sqlite", action="store_true", help="Use SQLite instead of MongoDB")
+    anom_parser.add_argument("--mongo", action="store_true", help="Use MongoDB instead of SQLite")
 
     # Watch command
     watch_parser = subparsers.add_parser("watch", help="Watch directory for changes and auto-reindex")
     watch_parser.add_argument("project_path", help="Path to the project directory")
     watch_parser.add_argument("--enrich", action="store_true", help="Run LLM semantic enrichment on re-index")
-    watch_parser.add_argument("--sqlite", action="store_true", help="Use SQLite instead of MongoDB")
+    watch_parser.add_argument("--mongo", action="store_true", help="Use MongoDB instead of SQLite")
 
     # Remove command
     remove_parser = subparsers.add_parser("remove", help="Remove a project from SQLite")
@@ -53,7 +53,7 @@ def main():
 
     # Enrich command
     enrich_parser = subparsers.add_parser("enrich", help="Run LLM semantic enrichment on existing index")
-    enrich_parser.add_argument("--sqlite", action="store_true", help="Use SQLite instead of MongoDB")
+    enrich_parser.add_argument("--mongo", action="store_true", help="Use MongoDB instead of SQLite")
 
     # SQLite-specific commands
     sqlite_parser = subparsers.add_parser("sqlite", help="SQLite database management")
@@ -71,7 +71,7 @@ def main():
     # Watch-all: watch all registered paths from the watch database
     watch_all_parser = subparsers.add_parser("watch-all", help="Watch all registered paths from watch database")
     watch_all_parser.add_argument("--enrich", action="store_true", help="Enable LLM semantic enrichment")
-    watch_all_parser.add_argument("--sqlite", action="store_true", help="Use SQLite instead of MongoDB")
+    watch_all_parser.add_argument("--mongo", action="store_true", help="Use MongoDB instead of SQLite")
 
     args = parser.parse_args()
 
@@ -83,30 +83,30 @@ def main():
             pass  # Non-critical if DB is down
 
     if args.command == "index":
-        if args.sqlite:
+        if not args.mongo:
             _index_sqlite(args)
         else:
             _index_mongodb(args)
 
     elif args.command == "status":
-        if args.sqlite:
+        if not args.mongo:
             _status_sqlite()
         else:
             _status_mongodb()
 
     elif args.command == "query":
-        if args.sqlite:
+        if not args.mongo:
             _query_sqlite(args)
         else:
             _query_mongodb(args)
 
     elif args.command == "serve":
         from cil.mcp.server import create_mcp_server
-        server = create_mcp_server(use_sqlite=args.sqlite)
+        server = create_mcp_server(use_sqlite=not args.mongo)
         server()
 
     elif args.command == "anomalies":
-        if args.sqlite:
+        if not args.mongo:
             _anomalies_sqlite(args)
         else:
             _anomalies_mongodb(args)
@@ -123,7 +123,7 @@ def main():
         sqlite_db.register_watched_path(project_path)
 
         from cil.watcher import FileWatcher
-        watcher = FileWatcher(project_path, enrich=args.enrich, use_sqlite=args.sqlite)
+        watcher = FileWatcher(project_path, enrich=args.enrich, use_sqlite=not args.mongo)
         watcher.start()
 
     elif args.command == "watch-all":
@@ -149,7 +149,7 @@ def main():
 
         watchers = []
         for path in valid_paths:
-            watcher = FileWatcher(path, enrich=args.enrich, use_sqlite=args.sqlite)
+            watcher = FileWatcher(path, enrich=args.enrich, use_sqlite=not args.mongo)
             t = threading.Thread(target=watcher.start, daemon=True)
             t.start()
             watchers.append((watcher, t))
@@ -166,7 +166,7 @@ def main():
         print(f"Removed project: {args.project_path}")
 
     elif args.command == "enrich":
-        if args.sqlite:
+        if not args.mongo:
             _enrich_sqlite()
         else:
             _enrich_mongodb()

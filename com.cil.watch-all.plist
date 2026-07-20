@@ -9,7 +9,6 @@
     <array>
         <string>/Users/iamefe/Documents/projects/cil/.venv/bin/cil</string>
         <string>watch-all</string>
-        <string>--sqlite</string>
     </array>
 
     <key>RunAtLoad</key>

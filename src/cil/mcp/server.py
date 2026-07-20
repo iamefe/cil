@@ -3,12 +3,99 @@ import sys
 import time
 import os
 
-from cil.database import get_collection, get_db
+from cil.database import get_collection, get_db, _sanitize_error
 from cil.indexer import Indexer
 from cil import sqlite_db
 
+# --- Path redaction (privacy) ---
 
-def create_mcp_server(use_sqlite=False):
+_HOME = os.path.expanduser("~")
+
+
+def _redact_path(filepath):
+    """Convert an absolute filesystem path to a privacy-safe relative form.
+
+    - If filepath starts with $HOME, replace $HOME with ~
+    - Otherwise, keep just the last 3 path components as fallback
+    """
+    if not isinstance(filepath, str):
+        return filepath
+    real = os.path.realpath(filepath)
+    home_real = os.path.realpath(_HOME)
+    if real.startswith(home_real + os.sep) or real == home_real:
+        return "~" + real[len(home_real):]
+    # Fallback: last 3 components (preserve leading / for absolute paths)
+    parts = filepath.rstrip(os.sep).split(os.sep)
+    joined = os.sep.join(parts[-3:])
+    return os.sep + joined if filepath.startswith(os.sep) and len(parts) > 3 else filepath
+
+
+def _redact_paths_in_result(obj):
+    """Recursively redact known path-containing keys in dicts/lists."""
+    if isinstance(obj, dict):
+        result = {}
+        for k, v in obj.items():
+            if k in ("file_path", "project_path", "db_path"):
+                result[k] = _redact_path(v)
+            elif k in ("caller", "source", "callee"):
+                # These are "path:line:name" — redact only the path portion
+                if isinstance(v, str) and ":" in v:
+                    first_colon = v.index(":")
+                    result[k] = _redact_path(v[:first_colon]) + v[first_colon:]
+                else:
+                    result[k] = _redact_paths_in_result(v)
+            else:
+                result[k] = _redact_paths_in_result(v)
+        return result
+    if isinstance(obj, list):
+        return [_redact_paths_in_result(item) for item in obj]
+    return obj
+
+
+# --- Path allowlist security ---
+
+def _get_allowed_dirs():
+    """Return list of allowed root directories.
+
+    Read from CIL_ALLOWED_DIRS (comma-separated). If not set, default to $HOME.
+    """
+    env_val = os.environ.get("CIL_ALLOWED_DIRS", "")
+    if env_val:
+        dirs = [d.strip() for d in env_val.split(",") if d.strip()]
+        # Resolve each directory to its real path
+        return [os.path.realpath(d) for d in dirs]
+    home = os.environ.get("HOME", "/tmp")
+    return [os.path.realpath(home)]
+
+ALLOWED_DIRS = _get_allowed_dirs()
+
+
+def _is_path_allowed(path):
+    """Check that a filesystem path is within the allowed directories.
+
+    - Rejects paths containing '..' traversal sequences before resolution
+    - Resolves with os.path.realpath() and checks against allowlist
+    Returns (True, None) on success or (False, error_message) on rejection.
+    """
+    # Pre-resolution check: reject obvious traversal attempts
+    if ".." in path:
+        return False, f"Path contains traversal sequence '..': {path}"
+
+    resolved = os.path.realpath(path)
+
+    for allowed in ALLOWED_DIRS:
+        # Ensure trailing slash for proper prefix matching
+        # e.g., /home/user must not match /home/user_evil
+        if resolved == allowed or resolved.startswith(allowed + os.sep):
+            return True, None
+
+    return False, (
+        f"Path outside allowed directories: {path}. "
+        f"Allowed dirs: {', '.join(ALLOWED_DIRS)}"
+    )
+
+
+def create_mcp_server(use_sqlite=True):
     """Create an MCP server that wraps CIL endpoints as tools."""
 
     db_available_cache = {"ok": None, "ts": 0}
@@ -27,10 +114,11 @@ def create_mcp_server(use_sqlite=False):
             db_error_cache["error"] = None
             return True, None
         except Exception as e:
+            sanitized = _sanitize_error(e)
             db_available_cache["ok"] = False
             db_available_cache["ts"] = now
-            db_error_cache["error"] = str(e)
-            return False, str(e)
+            db_error_cache["error"] = sanitized
+            return False, sanitized
 
     def _db_error_response(error_msg):
         return {"content": [{"type": "text", "text": f"MongoDB connection failed: {error_msg}"}], "isError": True}
@@ -241,7 +329,7 @@ def create_mcp_server(use_sqlite=False):
         if use_sqlite:
             try:
                 db_path = os.environ.get("CIL_SQLITE_DB") or str(sqlite_db.PROJECTS_DIR)
-                return {"content": [{"type": "text", "text": json.dumps({"status": "ok", "backend": "sqlite", "db_path": db_path}, indent=2)}]}
+                return {"content": [{"type": "text", "text": json.dumps({"status": "ok", "backend": "sqlite", "db_path": _redact_path(db_path)}, indent=2)}]}
             except Exception as e:
                 return {"content": [{"type": "text", "text": json.dumps({"status": "error", "detail": str(e)}, indent=2)}], "isError": True}
         ok, err = _db_available()
@@ -252,6 +340,7 @@ def create_mcp_server(use_sqlite=False):
     def find_symbol(name):
         if use_sqlite:
             results = sqlite_db.find_symbol(name)
+            results = _redact_paths_in_result(results)
             return {"content": [{"type": "text", "text": json.dumps(results, indent=2, default=str)}]}
         ok, err = _db_available()
         if not ok:
@@ -264,11 +353,13 @@ def create_mcp_server(use_sqlite=False):
                 for sym in fi.get("symbols", []):
                     if name.lower() in sym.get("name", "").lower():
                         results.append(sym)
+        results = _redact_paths_in_result(results)
         return {"content": [{"type": "text", "text": json.dumps(results, indent=2, default=str)}]}
 
     def trace_mutations(target):
         if use_sqlite:
             results = sqlite_db.trace_mutations(target)
+            results = _redact_paths_in_result(results)
             return {"content": [{"type": "text", "text": json.dumps(results, indent=2, default=str)}]}
         ok, err = _db_available()
         if not ok:
@@ -279,11 +370,13 @@ def create_mcp_server(use_sqlite=False):
             for m in doc.get("mutations", []):
                 if target.lower() in m.get("target", "").lower():
                     results.append(m)
+        results = _redact_paths_in_result(results)
         return {"content": [{"type": "text", "text": json.dumps(results, indent=2, default=str)}]}
 
     def trace_calls(func_name):
         if use_sqlite:
             results = sqlite_db.trace_calls(func_name)
+            results = _redact_paths_in_result(results)
             return {"content": [{"type": "text", "text": json.dumps(results, indent=2, default=str)}]}
         ok, err = _db_available()
         if not ok:
@@ -297,11 +390,12 @@ def create_mcp_server(use_sqlite=False):
                     callers.append(edge)
                 if func_name.lower() in edge.get("callee", "").lower():
                     callees.append(edge)
-        return {"content": [{"type": "text", "text": json.dumps({"callers": callers, "callees": callees}, indent=2, default=str)}]}
+        return {"content": [{"type": "text", "text": json.dumps(_redact_paths_in_result({"callers": callers, "callees": callees}), indent=2, default=str)}]}
 
     def get_anomalies(severity=None):
         if use_sqlite:
             results = sqlite_db.get_anomalies(severity=severity)
+            results = _redact_paths_in_result(results)
             return {"content": [{"type": "text", "text": json.dumps(results, indent=2, default=str)}]}
         ok, err = _db_available()
         if not ok:
@@ -318,7 +412,7 @@ def create_mcp_server(use_sqlite=False):
                             continue
                         results.append({
                             "symbol": sym.get("name"),
-                            "file_path": sym.get("file_path"),
+                            "file_path": _redact_path(sym.get("file_path", "")),
                             "line_start": sym.get("line_start"),
                             "risk_flags": risk_flags,
                             "audit_notes": sym.get("audit_notes"),
@@ -326,18 +420,29 @@ def create_mcp_server(use_sqlite=False):
         return {"content": [{"type": "text", "text": json.dumps(results, indent=2, default=str)}]}
 
     def get_body(file_path, start=1, end=100):
+        # Security: validate path is within allowed directories
+        allowed, err_msg = _is_path_allowed(file_path)
+        if not allowed:
+            return {"content": [{"type": "text", "text": err_msg}], "isError": True}
+
+        redacted_path = _redact_path(file_path)
         try:
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                 lines = f.readlines()
             content = "".join(lines[start - 1:end])
-            return {"content": [{"type": "text", "text": f"{file_path}:{start}-{end}\n{content}"}]}
+            return {"content": [{"type": "text", "text": f"{redacted_path}:{start}-{end}\n{content}"}]}
         except FileNotFoundError:
-            return {"content": [{"type": "text", "text": f"File not found: {file_path}"}], "isError": True}
+            return {"content": [{"type": "text", "text": f"File not found: {redacted_path}"}], "isError": True}
 
     def index_project(project_path, enrich=False, incremental=False):
         from cil.models import CILIndex
+        # Security: validate path is within allowed directories before any file reading
+        allowed, err_msg = _is_path_allowed(project_path)
+        if not allowed:
+            return {"content": [{"type": "text", "text": err_msg}], "isError": True}
+
         if not os.path.isdir(project_path):
-            return {"content": [{"type": "text", "text": f"Directory not found: {project_path}"}], "isError": True}
+            return {"content": [{"type": "text", "text": f"Directory not found: {_redact_path(project_path)}"}], "isError": True}
 
         if use_sqlite:
             return _index_project_sqlite(project_path, enrich, incremental)
@@ -370,7 +475,7 @@ def create_mcp_server(use_sqlite=False):
 
         return {"content": [{"type": "text", "text": json.dumps({
             "status": "indexed",
-            "project_path": cil_index.project_path,
+            "project_path": _redact_path(cil_index.project_path),
             "file_count": len(cil_index.file_indices),
             "symbol_count": sum(len(fi.symbols) for fi in cil_index.file_indices.values()),
             "enriched": enrich,
@@ -394,7 +499,7 @@ def create_mcp_server(use_sqlite=False):
 
         return {"content": [{"type": "text", "text": json.dumps({
             "status": "indexed",
-            "project_path": cil_index.project_path,
+            "project_path": _redact_path(cil_index.project_path),
             "file_count": len(cil_index.file_indices),
             "symbol_count": sum(len(fi.symbols) for fi in cil_index.file_indices.values()),
             "enriched": enrich,
@@ -402,10 +507,17 @@ def create_mcp_server(use_sqlite=False):
         }, indent=2)}]}
 
     def file_summary(path):
+        # Security: validate path is within allowed directories
+        allowed, err_msg = _is_path_allowed(path)
+        if not allowed:
+            return {"content": [{"type": "text", "text": err_msg}], "isError": True}
+
+        redacted_input = _redact_path(path)
         if use_sqlite:
             result = sqlite_db.get_file_summary(path)
             if result is None:
-                return {"content": [{"type": "text", "text": f"File not found in index: {path}"}], "isError": True}
+                return {"content": [{"type": "text", "text": f"File not found in index: {redacted_input}"}], "isError": True}
+            result = _redact_paths_in_result(result)
             return {"content": [{"type": "text", "text": json.dumps(result, indent=2, default=str)}]}
         ok, err = _db_available()
         if not ok:
@@ -416,15 +528,16 @@ def create_mcp_server(use_sqlite=False):
             if path in file_indices:
                 fi = file_indices[path]
                 return {"content": [{"type": "text", "text": json.dumps({
-                    "file_path": fi.get("file_path"),
-                    "symbols": fi.get("symbols", []),
+                    "file_path": _redact_path(fi.get("file_path", "")),
+                    "symbols": _redact_paths_in_result(fi.get("symbols", [])),
                     "imports": fi.get("imports", []),
                 }, indent=2, default=str)}]}
-        return {"content": [{"type": "text", "text": f"File not found in index: {path}"}], "isError": True}
+        return {"content": [{"type": "text", "text": f"File not found in index: {redacted_input}"}], "isError": True}
 
     def status():
         if use_sqlite:
             projects = sqlite_db.get_status()
+            projects = _redact_paths_in_result(projects)
             return {"content": [{"type": "text", "text": json.dumps(projects, indent=2, default=str)}]}
         ok, err = _db_available()
         if not ok:
@@ -434,7 +547,7 @@ def create_mcp_server(use_sqlite=False):
         result = []
         for doc in docs:
             result.append({
-                "project_path": doc.get("project_path"),
+                "project_path": _redact_path(doc.get("project_path", "")),
                 "indexed_at": doc.get("indexed_at"),
                 "version": doc.get("version", 1),
             })
@@ -487,6 +600,6 @@ def create_mcp_server(use_sqlite=False):
                 result = handle_request(req)
                 send_response(result, req_id)
             except Exception as e:
-                send_error(str(e), req_id)
+                send_error(_sanitize_error(e), req_id)
 
     return run

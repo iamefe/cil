@@ -16,10 +16,8 @@ CIL replaces `read_file` with a **queryable semantic index**. The agent never re
 
 ```
 read_file("server.py")      →  4,000 tokens of raw code
-cil_file_summary("server.py") →  ~200 tokens of structured understanding
+cil_file_summary("server.py") →  ~500 tokens of structured understanding
 ```
-
-Same tool call pattern. Same agent mental model. 20× less context consumption.
 
 ## How It Works
 
@@ -30,7 +28,7 @@ Codebase
     ↓
 [Indexer]            — symbol extraction, call graph, mutation tracking
     ↓
-[Anomaly Detector]   — static analysis: thread safety, silent exceptions, resource leaks
+[Anomaly Detector]   — multi-language static analysis: bare excepts, unwrap calls, unchecked errors, empty catches, gets/strcpy, and more
     ↓
 [SQLite]             — structured, queryable, persistent (per-project DBs)
     ↓
@@ -55,6 +53,102 @@ CIL uses [tree-sitter](https://tree-sitter.github.io/) for language-native parsi
 | Java | `.java` | methods, constructors, classes, variables |
 | C | `.c`, `.h` | functions, structs, declarations, macros |
 
+## Anomaly Detection
+
+CIL runs language-native static analysis during indexing — no LLM required. Each language has checks tailored to its common pitfalls:
+
+### Python (12 checks)
+
+| Check | Severity | Example |
+|---|---|---|
+| `bare_except` | high | `except:` without exception type |
+| `bare_raise` | medium | Reraise without context |
+| `mutable_default` | high | `def f(x=[])` shared across calls |
+| `long_function` | medium | >80 lines |
+| `deep_nesting` | medium | >4 levels of if/for/while/with/try |
+| `resource_leak` | high | `open()` outside `with` statement |
+| `unused_import` | low | Imported but never referenced |
+| `global_mutation` | medium | Use of `global` keyword |
+| `missing_init` | low | Class with methods but no `__init__` |
+| `star_import` | medium | `from x import *` |
+| `eval_exec` | high | `eval()` or `exec()` call |
+| `hardcoded_secret` | high | String literal assigned to secret-named variable |
+
+### TypeScript (9 checks)
+
+| Check | Severity | Example |
+|---|---|---|
+| `empty_catch` | medium | `catch {}` swallows errors silently |
+| `any_type` | medium | Using `any` defeats TS type safety |
+| `long_function` | medium | >80 lines |
+| `deep_nesting` | medium | >4 levels |
+| `eval_usage` | high | `eval()` call |
+| `console_logging` | low | `console.log/debug/warn/error` in source |
+| `unused_import` | low | Imported binding never referenced |
+| `wildcard_import` | medium | `import * as x from '...'` |
+| `hardcoded_secret` | high | Secret-named variable assigned string literal |
+
+### JavaScript (10 checks)
+
+| Check | Severity | Example |
+|---|---|---|
+| `empty_catch` | medium | `catch {}` |
+| `eval_usage` | high | `eval()`, `Function()` constructor, `setTimeout("...")` |
+| `with_statement` | high | Deprecated, breaks strict mode |
+| `var_declaration` | low | Use of `var` instead of `const`/`let` |
+| `long_function` | medium | >80 lines |
+| `deep_nesting` | medium | >4 levels |
+| `unused_import` | low | Imported but not used |
+| `wildcard_import` | medium | `import * as x from '...'` |
+| `console_logging` | low | Console calls left in source |
+| `hardcoded_secret` | high | Secret-named variable with string literal |
+
+### Go (5 checks)
+
+| Check | Severity | Example |
+|---|---|---|
+| `unchecked_error` | high | `_ = doSomething()` or dropped error return |
+| `blank_identifier_error` | medium | `_` where error conventionally returned |
+| `long_function` | medium | >80 lines |
+| `deep_nesting` | medium | >4 levels of if/for/select/switch/range |
+| `hardcoded_secret` | high | Secret-named variable with string literal |
+
+### Rust (6 checks)
+
+| Check | Severity | Example |
+|---|---|---|
+| `unwrap_call` | high | `.unwrap()` panics on Err with no diagnostic info |
+| `expect_no_message` | medium | `.expect("")` empty message provides no context |
+| `unsafe_block` | medium | `unsafe {}` bypasses borrow checker |
+| `panic_macro` | low | `panic!` macro usage |
+| `long_function` | medium | >80 lines |
+| `hardcoded_secret` | high | Secret-named variable with string literal |
+
+### Java (7 checks)
+
+| Check | Severity | Example |
+|---|---|---|
+| `empty_catch_block` | medium | `catch (Exception e) {}` swallows errors |
+| `broad_exception_handling` | medium | Catching `Exception` or `Throwable` directly |
+| `unused_import` | low | Imported class never referenced |
+| `long_method` | medium | >80 lines |
+| `deep_nesting` | medium | >4 levels |
+| `raw_type_usage` | low | Raw generics: `List items` instead of `List<String>` |
+| `hardcoded_secret` | high | Secret-named variable with string literal |
+
+### C/C++ (8 checks)
+
+| Check | Severity | Example |
+|---|---|---|
+| `gets_usage` | critical | `gets()` — buffer overflow guaranteed |
+| `resource_leak_malloc` | high | `malloc()` without matching `free()` |
+| `resource_leak_fopen` | high | `fopen()` without matching `fclose()` |
+| `scanf_no_width` | medium | `scanf("%s", ...)` without width specifier |
+| `strcpy_strcat` | medium | Unbounded string operations |
+| `long_function` | medium | >80 lines |
+| `deep_nesting` | medium | >4 levels |
+| `hardcoded_secret` | high | Secret-named variable with string literal |
+
 ## Installation
 
 ```bash
@@ -69,35 +163,67 @@ pip install cil
 
 ### Environment Setup
 
-CIL defaults to MongoDB. To use SQLite instead, pass `--sqlite` to any command, or set `CIL_SQLITE_DB`.
+CIL uses SQLite by default — no external database required. No configuration needed.
 
-For MongoDB, set `MONGO_URI` in `.env-local`:
+Configuration is done via a `.env` file at the project root (git-ignored). Copy the provided template and fill in your values:
 
 ```bash
-# Copy and edit the environment file
-cp .env .env-local
-# Edit .env-local with your MONGO_URI
+cp .env.example .env
 ```
 
-The `.env` file is git-ignored. Use `.env-local` for your own credentials.
+| Variable | Purpose | Default |
+|---|---|---|
+| `MONGO_URI` | MongoDB connection string (required for `--mongo`) | None (SQLite) |
+| `OPENAI_API_KEY` | API key for LLM semantic enrichment (`--enrich`) | None (skip) |
+| `OPENAI_BASE_URL` | Custom OpenAI-compatible endpoint for enrichment | None (OpenAI) |
+| `CIL_LLM_MODEL` | Model name for enrichment | `gpt-4o-mini` |
+| `CIL_SQLITE_DB` | Custom SQLite DB path | Auto-created per project |
+| `CIL_MAX_FILE_SIZE` | Max file size to index (bytes) | 5 MB |
+| `CIL_ALLOWED_DIRS` | Comma-separated allowlist of directories for MCP server | All accessible paths |
+| `CIL_API_KEY` | Bearer token for Flask API auth | Disabled (no auth) |
+| `CIL_CORS_ORIGINS` | Comma-separated allowed CORS origins | `localhost,127.0.0.1` |
+
+### MongoDB Setup
+
+To use MongoDB instead of SQLite, set `MONGO_URI` in `.env` and pass `--mongo` to any command:
+
+```bash
+cil index /path/to/project --mongo
+```
+
+The MongoDB URI format: `mongodb+srv://user:pass@cluster.mongodb.net/db_name?retryWrites=true`
+
+### LLM Enrichment Setup
+
+Optional semantic enrichment adds purpose descriptions, complexity scores, and risk flags to symbols. Requires an OpenAI-compatible API key.
+
+Set `OPENAI_API_KEY` in `.env`, then use `--enrich` during indexing or run `cil enrich` on existing data:
+
+```bash
+cil index /path/to/project --enrich
+# Or enrich after the fact:
+cil enrich /path/to/project
+```
+
+For a custom endpoint (e.g., local llama.cpp), set `OPENAI_BASE_URL` and `CIL_LLM_MODEL`.
 
 ## Quick Start
 
 ```bash
-# 1. Index a project (use --sqlite for SQLite storage)
-cil index /path/to/your/project --sqlite
+# 1. Index a project
+cil index /path/to/your/project
 
 # 2. Check what's indexed
-cil status --sqlite
+cil status
 
 # 3. Query for a symbol
-cil query "my_function" --sqlite
+cil query "my_function"
 
 # 4. List anomalies
-cil anomalies --severity high --sqlite
+cil anomalies --severity high
 ```
 
-Without `--sqlite`, CIL uses MongoDB as the storage backend.
+To use MongoDB instead of SQLite, add `--mongo` to any command.
 
 ## CLI Reference
 
@@ -107,16 +233,16 @@ Index a project directory. Parses all supported file types, extracts symbols, bu
 
 | Flag | Description |
 |---|---|
-| `--sqlite` | Use SQLite storage (default is MongoDB) |
+| `--mongo` | Use MongoDB storage (default is SQLite) |
 | `--enrich` | Run LLM semantic enrichment (purpose, complexity, risk scoring) |
 | `--incremental` | Only re-index files that have changed since last index |
 | `--force` | Clear old index before re-indexing |
 
 ```bash
-cil index /path/to/project --sqlite
-cil index /path/to/project --sqlite --enrich
-cil index /path/to/project --sqlite --incremental
-cil index /path/to/project --sqlite --force
+cil index /path/to/project
+cil index /path/to/project --enrich
+cil index /path/to/project --incremental
+cil index /path/to/project --force
 ```
 
 ### `cil status`
@@ -125,10 +251,10 @@ Show index freshness and stats for all indexed projects.
 
 | Flag | Description |
 |---|---|
-| `--sqlite` | Use SQLite storage (default is MongoDB) |
+| `--mongo` | Use MongoDB storage (default is SQLite) |
 
 ```bash
-cil status --sqlite
+cil status
 # Output:
 #   /path/to/project (v1) — 2026-06-29 11:51:54 (532 files, 1139 symbols)
 ```
@@ -139,10 +265,10 @@ Find a symbol across all indexed projects.
 
 | Flag | Description |
 |---|---|
-| `--sqlite` | Use SQLite storage (default is MongoDB) |
+| `--mongo` | Use MongoDB storage (default is SQLite) |
 
 ```bash
-cil query "updateStatus" --sqlite
+cil query "updateStatus"
 # Output:
 #   updateStatus — src/server.py:42-89
 #     def updateStatus(status: str)
@@ -150,18 +276,18 @@ cil query "updateStatus" --sqlite
 
 ### `cil anomalies`
 
-List detected anomalies across all indexed projects.
+List detected anomalies across all indexed files in all supported languages.
 
 | Flag | Description |
 |---|---|
-| `--sqlite` | Use SQLite storage (default is MongoDB) |
+| `--mongo` | Use MongoDB storage (default is SQLite) |
 | `--severity low|medium|high` | Filter by severity |
 | `--file <path>` | Filter by file path |
 
 ```bash
-cil anomalies --sqlite
-cil anomalies --sqlite --severity high
-cil anomalies --sqlite --file src/server.py
+cil anomalies
+cil anomalies --severity high
+cil anomalies --file src/server.py
 ```
 
 ### `cil watch <project_path>`
@@ -170,12 +296,12 @@ Watch a directory for file changes and auto-reindex. Uses `watchdog` with a 2-se
 
 | Flag | Description |
 |---|---|
-| `--sqlite` | Use SQLite storage (default is MongoDB) |
+| `--mongo` | Use MongoDB storage (default is SQLite) |
 | `--enrich` | Run LLM semantic enrichment on re-index |
 
 ```bash
-cil watch /path/to/project --sqlite
-cil watch /path/to/project --sqlite --enrich
+cil watch /path/to/project
+cil watch /path/to/project --enrich
 ```
 
 ### `cil watch-all`
@@ -184,11 +310,11 @@ Watch all registered paths from the watch database. Validates paths on startup, 
 
 | Flag | Description |
 |---|---|
-| `--sqlite` | Use SQLite storage (default is MongoDB) |
+| `--mongo` | Use MongoDB storage (default is SQLite) |
 | `--enrich` | Run LLM semantic enrichment on re-index |
 
 ```bash
-cil watch-all --sqlite
+cil watch-all
 ```
 
 ### `cil remove <project_path>`
@@ -208,10 +334,10 @@ Run LLM semantic enrichment on existing index. Requires `OPENAI_API_KEY` in envi
 
 | Flag | Description |
 |---|---|
-| `--sqlite` | Use SQLite storage (default is MongoDB) |
+| `--mongo` | Use MongoDB storage (default is SQLite) |
 
 ```bash
-cil enrich --sqlite
+cil enrich
 ```
 
 ### `cil serve`
@@ -220,10 +346,10 @@ Start the MCP server over stdio for agent integration.
 
 | Flag | Description |
 |---|---|
-| `--sqlite` | Use SQLite storage (default is MongoDB) |
+| `--mongo` | Use MongoDB storage (default is SQLite) |
 
 ```bash
-cil serve --sqlite
+cil serve
 ```
 
 ### `cil sqlite` Subcommands
@@ -305,21 +431,8 @@ Set `CIL_SQLITE_DB` to use a single database file for all projects:
 
 ```bash
 export CIL_SQLITE_DB=/path/to/cil.db
-cil index /path/to/project --sqlite
-```
+ cil index /path/to/project
 
-### MongoDB (Optional)
-
-MongoDB is supported as an alternative backend. Set `MONGO_URI` in `.env-local`:
-
-```bash
-MONGO_URI=mongodb+srv://user:pass@cluster.mongodb.net/cil
-```
-
-Then index without `--sqlite`:
-
-```bash
-cil index /path/to/project
 ```
 
 ## MCP Server Setup
@@ -353,7 +466,7 @@ The entrypoint script (`cil-mcp-entrypoint.py`) is pre-configured to use SQLite.
 Run the MCP server directly:
 
 ```bash
-cil serve --sqlite
+cil serve
 ```
 
 Or use the entrypoint:
@@ -526,7 +639,7 @@ cil_get_body("src/config.py", 10, 25)
 
 - [x] Architecture designed and validated
 - [x] Static indexer — tree-sitter AST parsing, call graph, mutation tracking
-- [x] Anomaly detection — thread safety, silent exceptions, resource leaks
+- [x] Anomaly detection — multi-language static analysis for Python (12), TypeScript (9), JavaScript (10), Go (5), Rust (6), Java (7), C/C++ (8)
 - [x] Multi-language support — Python, TypeScript, JavaScript, Go, Rust, Java, C
 - [x] SQLite storage — per-project databases, no external dependencies
 - [x] MongoDB storage — optional alternative backend
@@ -583,7 +696,7 @@ tail -f /tmp/cil-watch-all.log
 
 ### How It Works
 
-1. Register paths with `cil watch <path>` (or `cil add <path> --sqlite`)
+1. Register paths with `cil watch <path>`
 2. Paths are stored in `~/.cil/watch.db`
 3. `cil watch-all` reads all valid paths and starts a watcher for each
 4. launchd runs `cil watch-all` at boot and keeps it alive
@@ -656,3 +769,36 @@ Schema version 3 adds a `status` column to all index tables:
 | `anomalies` | `status` | `'active'` |
 
 The migration is applied automatically on first access after the schema version check.
+
+## Troubleshooting
+
+### Python 3.14 Incompatibility
+
+tree-sitter packages produce abi3 wheels that are incompatible with free-threaded Python 3.14 (CPython 3.14t). You'll see `symbol not found` errors on import.
+
+**Fix:** Use Python 3.12 or 3.13 instead:
+
+```bash
+pyenv install 3.13.0
+pyenv local 3.13.0
+pip install cil
+```
+
+### Linux: Missing C Toolchain for Language Packs
+
+Some tree-sitter language pack wheels require source compilation on Linux. If you see a build error, install a C compiler and development headers:
+
+- **Debian/Ubuntu:** `sudo apt-get install gcc libc-dev`
+- **RHEL/Fedora:** `sudo dnf install gcc glibc-devel`
+- **Alpine:** `apk add gcc musl-dev`
+
+Then retry installation: `pip install cil`
+
+### Windows: pip Version
+
+On Windows, use Python 3.12+ with pip >= 23 to ensure tree-sitter wheel resolution works correctly:
+
+```powershell
+python -m pip install --upgrade pip setuptools wheel
+pip install cil
+```

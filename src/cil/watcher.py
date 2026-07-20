@@ -1,3 +1,4 @@
+import logging
 import os
 import threading
 import time
@@ -8,6 +9,17 @@ from cil.models import CILIndex
 from cil import sqlite_db
 
 DEBOUNCE_SECONDS = 2
+
+
+def _is_within_project(filepath: str, project_path: str) -> bool:
+    """Check that a resolved filepath is within the project directory.
+
+    Resolves symlinks and relative paths (../ escapes) so an attacker cannot
+    place a symlink inside the watched tree pointing outside it.
+    """
+    real = os.path.realpath(filepath)
+    base = os.path.realpath(project_path)
+    return real.startswith(base + os.sep) or real == base
 
 
 class FileWatcher:
@@ -44,7 +56,9 @@ class FileWatcher:
         self.running = True
         handler = _make_handler(self)
         observer = Observer()
-        observer.schedule(handler, self.project_path, recursive=True)
+        # SECURITY: refuse to follow symlinks — prevents symlink-based data exfiltration
+        observer.schedule(handler, self.project_path, recursive=True,
+                          follow_links=False)
         observer.start()
         print(f"Watching {self.project_path} for changes...")
 
@@ -129,19 +143,30 @@ def _make_handler(watcher: FileWatcher):
         def __init__(self, w):
             self.watcher = w
 
-        def on_modified(self, event):
+        def _safe_event(self, event):
+            """Filter out symlinks that point outside the project directory."""
             if event.is_directory:
-                return
-            self.watcher._schedule_reindex()
+                return False
+            filepath = event.src_path
+            if not _is_within_project(filepath, self.watcher.project_path):
+                logging.warning(
+                    "Watchdog: skipped file outside project — %s (resolved to %s)",
+                    filepath,
+                    os.path.realpath(filepath),
+                )
+                return False
+            return True
+
+        def on_modified(self, event):
+            if self._safe_event(event):
+                self.watcher._schedule_reindex()
 
         def on_created(self, event):
-            if event.is_directory:
-                return
-            self.watcher._schedule_reindex()
+            if self._safe_event(event):
+                self.watcher._schedule_reindex()
 
         def on_deleted(self, event):
-            if event.is_directory:
-                return
-            self.watcher._schedule_reindex()
+            if self._safe_event(event):
+                self.watcher._schedule_reindex()
 
     return _FileChangeHandler(watcher)

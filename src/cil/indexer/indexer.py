@@ -1,9 +1,12 @@
 import hashlib
+import logging
 import os
 
 from cil.indexer.ast_parser import ASTParser
-from cil.indexer.anomaly_detector import AnomalyDetector
+from cil.indexer.anomaly_detector.dispatcher import AnomalyDetector
 from cil.models import CILIndex, FileIndex
+
+MAX_FILE_SIZE = int(os.environ.get("CIL_MAX_FILE_SIZE", 5 * 1024 * 1024))
 
 PYTHON_EXTENSIONS = {".py", ".pyi"}
 SUPPORTED_EXTENSIONS = {
@@ -49,6 +52,7 @@ class Indexer:
         files whose hash has changed.
         """
         project_path = os.path.abspath(project_path)
+        real_project = os.path.realpath(project_path)
 
         # Build previous hash map for incremental mode
         prev_hashes: dict[str, str] = {}
@@ -85,6 +89,22 @@ class Indexer:
                     continue
 
                 file_path = os.path.join(root, fname)
+                real_file = os.path.realpath(file_path)
+                if not (real_file.startswith(real_project + os.sep) or real_file == real_project):
+                    logging.warning(f"Skipping file outside project scope: {file_path}")
+                    continue
+
+                # Skip oversized files — prevent memory exhaustion during parsing
+                try:
+                    file_size = os.path.getsize(file_path)
+                    if file_size > MAX_FILE_SIZE:
+                        logging.warning(
+                            f"Skipping oversized file ({file_size} bytes, limit {MAX_FILE_SIZE}): {file_path}"
+                        )
+                        continue
+                except OSError:
+                    pass
+
                 current_hash = _file_hash(file_path)
 
                 # Incremental: skip unchanged files
@@ -130,7 +150,7 @@ class Indexer:
 
         # Optional LLM enrichment
         if enrich:
-            self._llm_enrich(file_indices)
+            self._llm_enrich(file_indices, real_project)
 
         cil_index = CILIndex(
             project_path=project_path,
@@ -166,8 +186,12 @@ class Indexer:
                     flags.update(line_anomalies[line])
             sym.risk_flags = sorted(flags)
 
-    def _llm_enrich(self, file_indices: dict[str, FileIndex]):
-        """Run LLM enrichment on all symbols."""
+    def _llm_enrich(self, file_indices: dict[str, FileIndex], real_project: str | None = None):
+        """Run LLM enrichment on all symbols.
+
+        If real_project is provided, each file path is resolved and verified
+        to stay within project bounds before reading.
+        """
         from cil.enricher.enricher import SemanticEnricher
 
         enricher = SemanticEnricher()
@@ -178,6 +202,12 @@ class Indexer:
         # Build source lines map
         source_map = {}
         for file_path in file_indices:
+            # Defense-in-depth: verify file stays within project scope
+            if real_project:
+                real_file = os.path.realpath(file_path)
+                if not (real_file.startswith(real_project + os.sep) or real_file == real_project):
+                    logging.warning(f"Skipping file outside project scope during enrichment: {file_path}")
+                    continue
             try:
                 with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                     source_map[file_path] = f.read()
