@@ -1,22 +1,26 @@
 # Code Intelligence Layer (CIL) — Queryable Codebase Index for AI Agents
 
-> **Why AI agents shouldn't read files.**
+> **Why AI agents should index before they read.**
 
 ## The Problem
 
-Every AI coding agent today uses `read_file` as its primary tool for understanding code. This is the wrong primitive.
+Every AI coding agent today uses `read_file` as its primary tool for understanding code. For large files, this is inefficient.
 
 `read_file` was designed for humans who skim. Agents don't skim — they ingest everything linearly into a fixed context window. A single 500-line file consumes ~4,000 tokens. Ten files across one session means 40,000 tokens of raw source code riding the KV cache, most of it never referenced again.
 
-The problem isn't the agent. It's the primitive.
+The problem isn't the agent or the tool. It's reading blind.
 
 ## The Solution
 
-CIL replaces `read_file` with a **queryable semantic index**. The agent never reads a file. It queries a knowledge layer that already understands the codebase.
+CIL sits between the agent and `read_file` as a queryable structural index. Instead of reading entire files blindly, the agent queries for symbols first, then fetches only the lines it needs via `cil_get_body`. For large files (>200 lines), this typically saves 60–70% of tokens compared to full-file reads.
 
 ```
-read_file("server.py")      →  4,000 tokens of raw code
-cil_file_summary("server.py") →  ~500 tokens of structured understanding
+# Reading blindly vs. reading surgically (example: 500-line server.py)
+
+read_file("server.py")                  →  ~4,000 tokens (everything)
+cil_file_summary + targeted cil_get_body →  ~1,200 tokens (map + only what you need)
+
+# For small files (<50 lines), read_file is often cheaper than index lookup overhead.
 ```
 
 ## How It Works
@@ -32,7 +36,7 @@ Codebase
     ↓
 [SQLite]             — structured, queryable, persistent (per-project DBs)
     ↓
-[MCP Tools]          ← agent queries here instead of reading files
+[MCP Tools]          ← agent queries for structure, then fetches targeted lines
     ↓
   Agent
 ```
