@@ -23,18 +23,6 @@ cil_file_summary + targeted cil_get_body →  ~1,200 tokens (map + only what you
 # For small files (<50 lines), read_file is often cheaper than index lookup overhead.
 ```
 
-## Agent Skill (Quick Install)
-
-Install CIL as a ready-to-use skill across 70+ AI coding agents (OpenCode, Claude Code, Cursor, Codex, Windsurf, etc.):
-
-```bash
-npx skills add iamefe/cil-skills -g
-```
-
-This drops a SKILL.md into your agent's skill directory with usage patterns, tool references, and best practices. No manual MCP configuration needed for most agents.
-
-For manual MCP setup, see [MCP Server Setup](#mcp-server-setup).
-
 ## How It Works
 
 ```
@@ -167,6 +155,8 @@ CIL runs language-native static analysis during indexing — no LLM required. Ea
 
 ## Installation
 
+### CLI (pip)
+
 ```bash
 # Install from GitHub
 pip install git+https://github.com/iamefe/cil.git
@@ -174,6 +164,16 @@ pip install git+https://github.com/iamefe/cil.git
 # Or clone and install in editable mode for development
 git clone https://github.com/iamefe/cil.git && cd cil && pip install -e .
 ```
+
+### Agent Skill (70+ agents)
+
+Install CIL as a ready-to-use skill across OpenCode, Claude Code, Cursor, Codex, Windsurf, and more:
+
+```bash
+npx skills add iamefe/cil-skills -g
+```
+
+This drops a SKILL.md into your agent's skill directory with usage patterns, tool references, and best practices. For manual MCP setup, see [MCP Server Setup](#mcp-server-setup).
 
 ### Environment Setup
 
