@@ -175,6 +175,16 @@ npx skills add iamefe/cil-skills -g
 
 This drops a SKILL.md into your agent's skill directory with usage patterns, tool references, and best practices. For manual MCP setup, see [MCP Server Setup](#mcp-server-setup).
 
+### Agent Enforcement
+
+To ensure agents always query CIL before reading files, add this rule to your agent config (e.g., `AGENTS.md` or `CLAUDE.md`):
+
+```markdown
+## CIL Before Read
+
+The `read_file` tool is prohibited in codebases unless a CIL tool has been called first. Always query the CIL index before reading files using `cil_find_symbol`, `cil_file_summary`, `cil_trace_calls`, or `cil_trace_mutations`. Only use `read_file` when CIL doesn't have the answer (raw line content, non-indexed files).
+```
+
 ### Environment Setup
 
 CIL uses SQLite by default — no external database required. No configuration needed.
