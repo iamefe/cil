@@ -10,6 +10,12 @@ from cil.database import get_collection, ensure_indexes
 from cil import sqlite_db
 
 
+def _norm(p: str) -> Path:
+    """Normalize a user-supplied path: expand ~ and resolve symlinks."""
+    from pathlib import Path
+    return Path(p).expanduser().resolve(strict=False)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Code Intelligence Layer (CIL)")
     subparsers = parser.add_subparsers(dest="command")
@@ -112,7 +118,7 @@ def main():
             _anomalies_mongodb(args)
 
     elif args.command == "watch":
-        project_path = os.path.abspath(args.project_path)
+        project_path = str(_norm(args.project_path))
 
         # Validate path exists
         if not os.path.exists(project_path):
@@ -179,7 +185,7 @@ def _index_sqlite(args):
     """Index a project using SQLite storage."""
     from cil.models import CILIndex
 
-    project_path = os.path.abspath(args.project_path)
+    project_path = str(_norm(args.project_path))
 
     # --force: clear old index
     if args.force:

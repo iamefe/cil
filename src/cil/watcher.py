@@ -7,6 +7,13 @@ from cil.database import get_collection
 from cil.indexer import Indexer
 from cil.models import CILIndex
 from cil import sqlite_db
+from pathlib import Path
+
+
+def _norm(p: str) -> Path:
+    """Normalize a user-supplied path: expand ~ and resolve symlinks."""
+    return Path(p).expanduser().resolve(strict=False)
+
 
 DEBOUNCE_SECONDS = 2
 
@@ -26,7 +33,7 @@ class FileWatcher:
     """Watch a project directory for file changes and re-index incrementally."""
 
     def __init__(self, project_path: str, enrich: bool = False, use_sqlite: bool = False):
-        self.project_path = os.path.abspath(project_path)
+        self.project_path = str(_norm(project_path))
         self.enrich = enrich
         self.use_sqlite = use_sqlite
         self.running = False

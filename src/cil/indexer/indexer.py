@@ -8,6 +8,14 @@ from cil.models import CILIndex, FileIndex
 
 MAX_FILE_SIZE = int(os.environ.get("CIL_MAX_FILE_SIZE", 5 * 1024 * 1024))
 
+from pathlib import Path
+
+
+def _norm(p: str) -> Path:
+    """Normalize a user-supplied path: expand ~ and resolve symlinks."""
+    return Path(p).expanduser().resolve(strict=False)
+
+
 PYTHON_EXTENSIONS = {".py", ".pyi"}
 SUPPORTED_EXTENSIONS = {
     ".py", ".pyi",   # Python
@@ -51,7 +59,7 @@ class Indexer:
         If incremental=True and previous_index is provided, only re-index
         files whose hash has changed.
         """
-        project_path = os.path.abspath(project_path)
+        project_path = str(_norm(project_path))
         real_project = os.path.realpath(project_path)
 
         # Build previous hash map for incremental mode

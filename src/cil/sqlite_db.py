@@ -10,6 +10,11 @@ from typing import Optional
 PROJECTS_DIR = Path.home() / ".cil" / "projects"
 
 
+def _norm_path(p: str) -> Path:
+    """Normalize a user-supplied path: expand ~ and resolve symlinks."""
+    return Path(p).expanduser().resolve(strict=False)
+
+
 SCHEMA_VERSION = 3
 
 

@@ -2,6 +2,7 @@ import json
 import sys
 import time
 import os
+from pathlib import Path
 
 from cil.database import get_collection, get_db, _sanitize_error
 from cil.indexer import Indexer
@@ -10,6 +11,11 @@ from cil import sqlite_db
 # --- Path redaction (privacy) ---
 
 _HOME = os.path.expanduser("~")
+
+
+def _norm(p: str) -> Path:
+    """Normalize a user-supplied path: expand ~ and resolve symlinks."""
+    return Path(p).expanduser().resolve(strict=False)
 
 
 def _redact_path(filepath):
@@ -63,9 +69,9 @@ def _get_allowed_dirs():
     if env_val:
         dirs = [d.strip() for d in env_val.split(",") if d.strip()]
         # Resolve each directory to its real path
-        return [os.path.realpath(d) for d in dirs]
+        return [str(_norm(d)) for d in dirs]
     home = os.environ.get("HOME", "/tmp")
-    return [os.path.realpath(home)]
+    return [str(_norm(home))]
 
 ALLOWED_DIRS = _get_allowed_dirs()
 
@@ -81,7 +87,7 @@ def _is_path_allowed(path):
     if ".." in path:
         return False, f"Path contains traversal sequence '..': {path}"
 
-    resolved = os.path.realpath(path)
+    resolved = str(_norm(path))
 
     for allowed in ALLOWED_DIRS:
         # Ensure trailing slash for proper prefix matching
