@@ -41,7 +41,7 @@ class FileIndex(BaseModel):
     file_path: str
     symbols: list[SymbolInfo] = Field(default_factory=list)
     imports: list[str] = Field(default_factory=list)
-    indexed_at: datetime = Field(default_factory=datetime.utcnow)
+    indexed_at: datetime = Field(default_factory=datetime.now)
     file_hash: str = ""
 
 
@@ -61,6 +61,6 @@ class CILIndex(BaseModel):
     call_graph: list[CallEdge] = Field(default_factory=list)
     mutations: list[MutationInfo] = Field(default_factory=list)
     anomalies: list[Anomaly] = Field(default_factory=list)
-    indexed_at: datetime = Field(default_factory=datetime.utcnow)
+    indexed_at: datetime = Field(default_factory=datetime.now)
     version: int = 1
 

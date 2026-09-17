@@ -212,7 +212,7 @@ cp .env.example .env
 To use MongoDB instead of SQLite, set `MONGO_URI` in `.env` and pass `--mongo` to any command:
 
 ```bash
-cil index /path/to/project --mongo
+cil index /path/to/project --mongo   # --name is ignored in --mongo mode
 ```
 
 The MongoDB URI format: `mongodb+srv://user:pass@cluster.mongodb.net/db_name?retryWrites=true`
@@ -224,9 +224,9 @@ Optional semantic enrichment adds purpose descriptions, complexity scores, and r
 Set `OPENAI_API_KEY` in `.env`, then use `--enrich` during indexing or run `cil enrich` on existing data:
 
 ```bash
-cil index /path/to/project --enrich
-# Or enrich after the fact:
-cil enrich /path/to/project
+cil index /path/to/project --name my-project --enrich
+# Or enrich all indexed projects after the fact:
+cil enrich
 ```
 
 For a custom endpoint (e.g., local llama.cpp), set `OPENAI_BASE_URL` and `CIL_LLM_MODEL`.
@@ -234,17 +234,17 @@ For a custom endpoint (e.g., local llama.cpp), set `OPENAI_BASE_URL` and `CIL_LL
 ## Quick Start
 
 ```bash
-# 1. Index a project
-cil index /path/to/your/project
+# 1. Index a project (--name is mandatory in SQLite mode)
+cil index /path/to/your/project --name my-project
 
 # 2. Check what's indexed
 cil status
 
 # 3. Query for a symbol
-cil query "my_function"
+cil query "my_function" --project my-project
 
 # 4. List anomalies
-cil anomalies --severity high
+cil anomalies --project my-project --severity high
 ```
 
 To use MongoDB instead of SQLite, add `--mongo` to any command.
@@ -257,17 +257,28 @@ Index a project directory. Parses all supported file types, extracts symbols, bu
 
 | Flag | Description |
 |---|---|
+| `--name NAME` | **Mandatory (SQLite mode)** unique DB name (e.g. `nibia-admin`). Must not be used by another indexed project. Drives the per-project DB location (`~/.cil/projects/<name>/<name>.db`). Ignored with `--mongo`. |
 | `--mongo` | Use MongoDB storage (default is SQLite) |
 | `--enrich` | Run LLM semantic enrichment (purpose, complexity, risk scoring) |
 | `--incremental` | Only re-index files that have changed since last index |
 | `--force` | Clear old index before re-indexing |
 
 ```bash
-cil index /path/to/project
-cil index /path/to/project --enrich
-cil index /path/to/project --incremental
-cil index /path/to/project --force
+cil index /path/to/project --name my-project
+cil index /path/to/project --name my-project --enrich
+cil index /path/to/project --name my-project --incremental
+cil index /path/to/project --name my-project --force
 ```
+
+Omitting `--name` in SQLite mode errors: `Error: --name is required in SQLite mode (unique DB name, e.g. 'nibia-admin').`
+
+**Uniqueness guard:** a name can only be claimed by ONE path. Re-indexing the same path with the same name is allowed (updates in place). Indexing a different path with an already-used name is refused:
+
+```
+Error: Project name 'my-project' is already used by /path/to/project. Choose a different name or remove that project first. Available names: my-project, other-project
+```
+
+Path flexibility: `cil index <path>` (and `--project <path>` on query commands) accepts `~/` as well as absolute paths — `~` is expanded before use.
 
 ### `cil status`
 
@@ -283,35 +294,41 @@ cil status
 #   /path/to/project (v1) — 2026-06-29 11:51:54 (532 files, 1139 symbols)
 ```
 
+Query commands accept either the name you gave with `--name` at index time, or the full path shown here.
+
 ### `cil query <symbol>`
 
-Find a symbol across all indexed projects.
+Find a symbol within an indexed project.
 
 | Flag | Description |
 |---|---|
+| `--project PROJECT` | **Required.** Project name or full indexed path to query. Use `cil status` to list projects. |
 | `--mongo` | Use MongoDB storage (default is SQLite) |
 
 ```bash
-cil query "updateStatus"
+cil query "updateStatus" --project my-project
 # Output:
 #   updateStatus — src/server.py:42-89
 #     def updateStatus(status: str)
 ```
 
+Omitting `--project` errors: `Error: 'project' argument is required. Use cil status to list indexed projects.` An unknown project errors with the list of available names.
+
 ### `cil anomalies`
 
-List detected anomalies across all indexed files in all supported languages.
+List detected anomalies for an indexed project.
 
 | Flag | Description |
 |---|---|
-| `--mongo` | Use MongoDB storage (default is SQLite) |
+| `--project PROJECT` | **Required.** Project name or full indexed path to query. Use `cil status` to list projects. |
 | `--severity low|medium|high` | Filter by severity |
 | `--file <path>` | Filter by file path |
+| `--mongo` | Use MongoDB storage (default is SQLite) |
 
 ```bash
-cil anomalies
-cil anomalies --severity high
-cil anomalies --file src/server.py
+cil anomalies --project my-project
+cil anomalies --project my-project --severity high
+cil anomalies --project my-project --file src/server.py
 ```
 
 ### `cil watch <project_path>`
@@ -382,11 +399,10 @@ SQLite-specific database management.
 
 #### `cil sqlite init`
 
-Initialize the SQLite database schema. Requires `CIL_SQLITE_DB` to be set.
+Initialize the SQLite database schema for a named project. Creates `~/.cil/projects/<name>/<name>.db`.
 
 ```bash
-export CIL_SQLITE_DB=/path/to/cil.db
-cil sqlite init
+cil sqlite init --name my-project
 ```
 
 #### `cil sqlite migrate`
@@ -399,10 +415,10 @@ cil sqlite migrate
 
 #### `cil sqlite query <symbol>`
 
-Query the SQLite database for a symbol (JSON output).
+Query the SQLite database for a symbol (JSON output). `--project` is required.
 
 ```bash
-cil sqlite query "updateStatus"
+cil sqlite query "updateStatus" --project my-project
 ```
 
 #### `cil sqlite remove <project_path>`
@@ -437,26 +453,31 @@ cil sqlite remove /path/to/project
 
 ### SQLite (Default)
 
-CIL uses SQLite by default — no external database required. Each project gets its own database file stored at:
+CIL uses SQLite by default — no external database required. Each project gets its own database file, keyed by the `--name` you choose at index time:
 
 ```
-~/.cil/projects/<project_name>/<project_name>.db
+~/.cil/projects/<name>/<name>.db
 ```
 
-For example, indexing `/Users/efe/projects/nibia/api` creates:
+For example:
+
+```bash
+cil index /Users/efe/projects/nibia/api --name nibia-api
+```
+
+creates:
 
 ```
-~/.cil/projects/api/api.db
+~/.cil/projects/nibia-api/nibia-api.db
 ```
 
 ### Single-DB Mode
 
-Set `CIL_SQLITE_DB` to use a single database file for all projects:
+Set `CIL_SQLITE_DB` to use a single database file for all projects (legacy mode; `--name` is not required here):
 
 ```bash
 export CIL_SQLITE_DB=/path/to/cil.db
- cil index /path/to/project
-
+cil index /path/to/project
 ```
 
 ## MCP Server Setup
@@ -516,7 +537,7 @@ Add to your Claude Code MCP configuration:
 
 ## MCP Tools Reference
 
-All tools are available when the MCP server is connected. The server uses SQLite by default.
+All tools are available when the MCP server is connected. The server uses SQLite by default. Most tools take a `project` parameter (required) — the name given with `--name` at index time, or a full indexed path.
 
 ### `cil_db_status`
 
@@ -530,54 +551,60 @@ Check database connectivity and backend status.
 }
 ```
 
-### `cil_index_project(project_path, enrich?, incremental?)`
+### `cil_index_project(project_path, name, enrich?, incremental?)`
 
 Index a project directory.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `project_path` | string | yes | Absolute path to the project directory |
+| `name` | string | yes | Mandatory unique DB name (e.g., `nibia-admin`). Must not be used by another indexed project. Ignored in MongoDB mode (which keys by `project_path`). |
 | `enrich` | boolean | no | Run LLM semantic enrichment (default: false) |
 | `incremental` | boolean | no | Only re-index changed files (default: false) |
 
-### `cil_file_summary(path)`
+### `cil_file_summary(path, project)`
 
 Get file-level summary and symbol list from the index.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `path` | string | yes | File path (e.g., `src/cil/indexer/ast_parser.py`) |
+| `project` | string | yes | Project name or full indexed path |
 
-### `cil_find_symbol(name)`
+### `cil_find_symbol(name, project)`
 
-Find a symbol across all indexed projects. Returns signature, line range, decorators, and semantic enrichment.
+Find a symbol within a project. Returns signature, line range, decorators, and semantic enrichment.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `name` | string | yes | Symbol name (e.g., `updateStatus`, `Delivery`) |
+| `project` | string | yes | Project name or full indexed path |
 
-### `cil_trace_mutations(target)`
+### `cil_trace_mutations(target, project)`
 
 Trace all writes to a variable or global state. Returns every location that assigns, augments, or deletes the target.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `target` | string | yes | Variable or state to trace (e.g., `_VISION_READY`, `delivery.status`) |
+| `project` | string | yes | Project name or full indexed path |
 
-### `cil_trace_calls(func_name)`
+### `cil_trace_calls(func_name, project)`
 
 Find callers and callees for a function. Returns the full call graph up and down.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `func_name` | string | yes | Function name to trace (e.g., `do_swap`, `updateStatus`) |
+| `project` | string | yes | Project name or full indexed path |
 
-### `cil_get_anomalies(severity?)`
+### `cil_get_anomalies(project, severity?)`
 
-Return all pre-computed anomaly flags. Filterable by severity.
+Return all pre-computed anomaly flags for a project. Filterable by severity.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
+| `project` | string | yes | Project name or full indexed path |
 | `severity` | string | no | Filter by severity (e.g., `low`, `medium`, `high`) |
 
 ### `cil_get_body(file, start?, end?)`
@@ -610,7 +637,7 @@ python3 -c "from cil.api.server import create_app; app = create_app(use_sqlite=T
 |---|---|---|
 | GET | `/cil/health` | Health check |
 | GET | `/cil/status` | Index freshness and stats |
-| POST | `/cil/index` | Trigger re-index (body: `{"project_path": "...", "enrich": true, "incremental": true}`) |
+| POST | `/cil/index` | Trigger re-index (body: `{"project_path": "...", "name": "my-project", "enrich": true, "incremental": true}`). `name` is required and uniqueness-validated in SQLite mode |
 | GET | `/cil/symbol/<name>` | Find symbol |
 | GET | `/cil/mutations/<target>` | Trace mutations |
 | GET | `/cil/calls/<func_name>` | Trace calls |
@@ -634,13 +661,13 @@ The core rule: **query the index before reading any file.**
 
 ```
 # 1. Find the function
-cil_find_symbol("processOrder")
+cil_find_symbol("processOrder", project="my-project")
 
 # 2. See what calls it
-cil_trace_calls("processOrder")
+cil_trace_calls("processOrder", project="my-project")
 
 # 3. Check for anomalies in that file
-cil_get_anomalies()
+cil_get_anomalies(project="my-project")
 
 # 4. Only now, read the specific lines
 cil_get_body("src/orders.py", 142, 160)
@@ -650,10 +677,10 @@ cil_get_body("src/orders.py", 142, 160)
 
 ```
 # 1. Find where the variable is written
-cil_trace_mutations("_VISION_READY")
+cil_trace_mutations("_VISION_READY", project="my-project")
 
 # 2. Find the symbol definition
-cil_find_symbol("_VISION_READY")
+cil_find_symbol("_VISION_READY", project="my-project")
 
 # 3. Read the definition lines
 cil_get_body("src/config.py", 10, 25)

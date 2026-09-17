@@ -99,7 +99,13 @@ class FileWatcher:
 
     def _do_reindex_sqlite(self):
         """Perform incremental re-index using SQLite."""
-        previous_index = sqlite_db.load_index(self.project_path)
+        db_path = sqlite_db.resolve_project(self.project_path)
+        if db_path is None:
+            print(f"No index for {self.project_path}, skipping watch re-index")
+            return
+        name = db_path.parent.name
+
+        previous_index = sqlite_db.load_index(self.project_path, db_path)
         if not previous_index:
             print(f"No index for {self.project_path}, skipping watch re-index")
             return
@@ -112,8 +118,8 @@ class FileWatcher:
             previous_index=previous_index,
         )
 
-        sqlite_db.store_index(cil_index)
-        print(f"Re-indexed {cil_index.project_path} ({len(cil_index.file_indices)} files)")
+        sqlite_db.store_index(cil_index, name, db_path)
+        print(f"Re-indexed {name} ({len(cil_index.file_indices)} files)")
 
     def _do_reindex_mongodb(self):
         """Perform incremental re-index using MongoDB."""

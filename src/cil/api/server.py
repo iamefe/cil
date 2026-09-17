@@ -1,6 +1,7 @@
 import logging
 import os
 import json
+from pathlib import Path
 from flask import Flask, request, jsonify
 
 try:
@@ -153,7 +154,9 @@ def create_app(use_sqlite=True) -> Flask:
         """Health check — MongoDB or SQLite connectivity."""
         if use_sqlite:
             try:
-                return jsonify({"status": "ok", "backend": "sqlite", "db_path": _redact_path(str(sqlite_db.get_db_path()))})
+                env_db = sqlite_db.env_db_path()
+                db_path = str(env_db) if env_db else str(sqlite_db.PROJECTS_DIR)
+                return jsonify({"status": "ok", "backend": "sqlite", "db_path": _redact_path(db_path)})
             except Exception as e:
                 return jsonify({"status": "error", "detail": _sanitize_error(e)}), 503
         from cil.database import get_db
@@ -195,11 +198,16 @@ def create_app(use_sqlite=True) -> Flask:
         if not os.path.isdir(project_path):
             return jsonify({"error": f"Directory not found: {_redact_path(project_path)}"}), 404
 
+        name = data.get("name", "")
         enrich = data.get("enrich", False)
         incremental = data.get("incremental", False)
 
         if use_sqlite:
-            return _cil_index_sqlite(project_path, enrich, incremental)
+            if not sqlite_db.env_db_path():
+                err = sqlite_db.validate_project_name(name) or sqlite_db.claim_project_name(name, project_path)
+                if err:
+                    return jsonify({"error": f"{err} Available names: {', '.join(sqlite_db.list_project_names()) or '(none)'}"}), 400
+            return _cil_index_sqlite(project_path, name, enrich, incremental)
 
         from cil.models import CILIndex
         previous_index = None
@@ -233,11 +241,15 @@ def create_app(use_sqlite=True) -> Flask:
             "incremental": incremental,
         })
 
-    def _cil_index_sqlite(project_path, enrich, incremental):
+    def _cil_index_sqlite(project_path, name, enrich, incremental):
         from cil.models import CILIndex
+        db_path = None
+        if not sqlite_db.env_db_path():
+            db_path = sqlite_db.get_project_db_path(name)
+
         previous_index = None
         if incremental:
-            previous_index = sqlite_db.load_index(project_path)
+            previous_index = sqlite_db.load_index(project_path, db_path)
 
         indexer = Indexer()
         cil_index = indexer.index_directory(
@@ -247,7 +259,7 @@ def create_app(use_sqlite=True) -> Flask:
             previous_index=previous_index,
         )
 
-        sqlite_db.store_index(cil_index)
+        sqlite_db.store_index(cil_index, name, db_path)
 
         return jsonify({
             "status": "indexed",

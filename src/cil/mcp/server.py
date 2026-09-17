@@ -129,6 +129,40 @@ def create_mcp_server(use_sqlite=True):
     def _db_error_response(error_msg):
         return {"content": [{"type": "text", "text": f"MongoDB connection failed: {error_msg}"}], "isError": True}
 
+    def _project_error_response(msg):
+        return {"content": [{"type": "text", "text": msg}], "isError": True}
+
+    def _resolve_project(project):
+        """Resolve the required 'project' argument to the indexed project identity.
+
+        Accepts a full indexed path or a bare project name (directory stem).
+        Returns (resolved, error): resolved is the project path string to use,
+        error is an MCP error response (or None if resolution succeeded).
+        """
+        if not project:
+            return None, _project_error_response("Error: 'project' argument is required. Use cil_status to list indexed projects.")
+        if use_sqlite:
+            if sqlite_db.resolve_project(project) is None:
+                available = ", ".join(sqlite_db.list_project_names())
+                return None, _project_error_response(f"Error: project '{project}' is not indexed. Available: {available}")
+            return project, None
+        ok, err = _db_available()
+        if not ok:
+            return None, _db_error_response(err)
+        col = get_collection()
+        target = str(_norm(project))
+        if col.count_documents({"project_path": target}) > 0:
+            return target, None
+        stems = {}
+        for d in col.find({}, {"project_path": 1, "_id": 0}):
+            pp = d.get("project_path")
+            if pp:
+                stems[Path(pp).stem] = pp
+        if Path(target).stem in stems:
+            return stems[Path(target).stem], None
+        available = ", ".join(sorted(stems.values()))
+        return None, _project_error_response(f"Error: project '{project}' is not indexed. Available: {available}")
+
     tools = [
         {
             "name": "cil_db_status",
@@ -140,7 +174,7 @@ def create_mcp_server(use_sqlite=True):
         },
         {
             "name": "cil_find_symbol",
-            "description": "Find a symbol (function, class, variable) across all indexed files. Returns signature, line range, decorators, and semantic enrichment.",
+            "description": "Find a symbol (function, class, variable) within a project. Returns signature, line range, decorators, and semantic enrichment.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -148,13 +182,17 @@ def create_mcp_server(use_sqlite=True):
                         "type": "string",
                         "description": "Symbol name to find (e.g., 'updateStatus', 'Delivery')",
                     },
+                    "project": {
+                        "type": "string",
+                        "description": "Project to query: indexed project name (e.g., 'nibia') or full indexed path. Required. Use cil_status to list projects.",
+                    },
                 },
-                "required": ["name"],
+                "required": ["name", "project"],
             },
         },
         {
             "name": "cil_trace_mutations",
-            "description": "Trace all writes to a variable or global state. Returns every location that assigns, augments, or deletes the target.",
+            "description": "Trace all writes to a variable or global state within a project. Returns every location that assigns, augments, or deletes the target.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -162,13 +200,17 @@ def create_mcp_server(use_sqlite=True):
                         "type": "string",
                         "description": "Variable or state to trace (e.g., '_VISION_READY', 'delivery.status')",
                     },
+                    "project": {
+                        "type": "string",
+                        "description": "Project to query: indexed project name (e.g., 'nibia') or full indexed path. Required. Use cil_status to list projects.",
+                    },
                 },
-                "required": ["target"],
+                "required": ["target", "project"],
             },
         },
         {
             "name": "cil_trace_calls",
-            "description": "Find callers and callees for a function. Returns the full call graph up and down.",
+            "description": "Find callers and callees for a function within a project. Returns the full call graph up and down.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -176,21 +218,30 @@ def create_mcp_server(use_sqlite=True):
                         "type": "string",
                         "description": "Function name to trace (e.g., 'do_swap', 'updateStatus')",
                     },
+                    "project": {
+                        "type": "string",
+                        "description": "Project to query: indexed project name (e.g., 'nibia') or full indexed path. Required. Use cil_status to list projects.",
+                    },
                 },
-                "required": ["func_name"],
+                "required": ["func_name", "project"],
             },
         },
         {
             "name": "cil_get_anomalies",
-            "description": "Return all pre-computed anomaly flags. Filterable by severity.",
+            "description": "Return all pre-computed anomaly flags for a project. Filterable by severity.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "Project to query: indexed project name (e.g., 'nibia') or full indexed path. Required. Use cil_status to list projects.",
+                    },
                     "severity": {
                         "type": "string",
                         "description": "Filter by severity (e.g., 'thread unsafe', 'no error handling')",
                     },
                 },
+                "required": ["project"],
             },
         },
         {
@@ -219,13 +270,17 @@ def create_mcp_server(use_sqlite=True):
         },
         {
             "name": "cil_index_project",
-            "description": "Index a project directory. Stores results in MongoDB or SQLite depending on mode.",
+            "description": "Index a project directory. SQLite mode stores results in the per-project DB named `name` (mandatory); MongoDB mode keys by project_path and ignores `name`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "project_path": {
                         "type": "string",
                         "description": "Absolute path to the project directory",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Mandatory unique DB name (e.g., 'nibia-admin'). Must not be used by another indexed project. Ignored in MongoDB mode.",
                     },
                     "enrich": {
                         "type": "boolean",
@@ -238,21 +293,25 @@ def create_mcp_server(use_sqlite=True):
                         "default": False,
                     },
                 },
-                "required": ["project_path"],
+                "required": ["project_path", "name"],
             },
         },
         {
             "name": "cil_file_summary",
-            "description": "Get file-level summary and symbol list from the index.",
+            "description": "Get file-level summary and symbol list from the index for a project.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "File path (e.g., 'src/cil/indexer/ast_parser.py')",
+                        "description": "File path (absolute, or relative to the project root)",
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": "Project to query: indexed project name (e.g., 'nibia') or full indexed path. Required. Use cil_status to list projects.",
                     },
                 },
-                "required": ["path"],
+                "required": ["path", "project"],
             },
         },
         {
@@ -296,16 +355,16 @@ def create_mcp_server(use_sqlite=True):
             return db_status()
 
         if name == "cil_find_symbol":
-            return find_symbol(arguments.get("name", ""))
+            return find_symbol(arguments.get("name", ""), arguments.get("project", ""))
 
         if name == "cil_trace_mutations":
-            return trace_mutations(arguments.get("target", ""))
+            return trace_mutations(arguments.get("target", ""), arguments.get("project", ""))
 
         if name == "cil_trace_calls":
-            return trace_calls(arguments.get("func_name", ""))
+            return trace_calls(arguments.get("func_name", ""), arguments.get("project", ""))
 
         if name == "cil_get_anomalies":
-            return get_anomalies(arguments.get("severity"))
+            return get_anomalies(arguments.get("project", ""), arguments.get("severity"))
 
         if name == "cil_get_body":
             return get_body(
@@ -317,12 +376,13 @@ def create_mcp_server(use_sqlite=True):
         if name == "cil_index_project":
             return index_project(
                 arguments.get("project_path", ""),
+                arguments.get("name", ""),
                 arguments.get("enrich", False),
                 arguments.get("incremental", False),
             )
 
         if name == "cil_file_summary":
-            return file_summary(arguments.get("path", ""))
+            return file_summary(arguments.get("path", ""), arguments.get("project", ""))
 
         if name == "cil_status":
             return status()
@@ -334,7 +394,7 @@ def create_mcp_server(use_sqlite=True):
     def db_status():
         if use_sqlite:
             try:
-                db_path = os.environ.get("CIL_SQLITE_DB") or str(sqlite_db.PROJECTS_DIR)
+                db_path = str(sqlite_db.env_db_path() or sqlite_db.PROJECTS_DIR)
                 return {"content": [{"type": "text", "text": json.dumps({"status": "ok", "backend": "sqlite", "db_path": _redact_path(db_path)}, indent=2)}]}
             except Exception as e:
                 return {"content": [{"type": "text", "text": json.dumps({"status": "error", "detail": str(e)}, indent=2)}], "isError": True}
@@ -343,54 +403,56 @@ def create_mcp_server(use_sqlite=True):
             return {"content": [{"type": "text", "text": json.dumps({"status": "ok", "backend": "mongodb"}, indent=2)}]}
         return {"content": [{"type": "text", "text": json.dumps({"status": "error", "detail": err}, indent=2)}], "isError": True}
 
-    def find_symbol(name):
+    def find_symbol(name, project=""):
+        resolved, err = _resolve_project(project)
+        if err:
+            return err
         if use_sqlite:
-            results = sqlite_db.find_symbol(name)
+            results = sqlite_db.find_symbol(name, project_path=resolved)
             results = _redact_paths_in_result(results)
             return {"content": [{"type": "text", "text": json.dumps(results, indent=2, default=str)}]}
-        ok, err = _db_available()
-        if not ok:
-            return _db_error_response(err)
         col = get_collection()
+        doc = col.find_one({"project_path": resolved}, {"file_indices": 1, "_id": 0})
         results = []
-        for doc in col.find({}, {"file_indices": 1, "_id": 0}):
-            file_indices = doc.get("file_indices", {})
-            for fi in file_indices.values():
+        if doc:
+            for fi in doc.get("file_indices", {}).values():
                 for sym in fi.get("symbols", []):
                     if name.lower() in sym.get("name", "").lower():
                         results.append(sym)
         results = _redact_paths_in_result(results)
         return {"content": [{"type": "text", "text": json.dumps(results, indent=2, default=str)}]}
 
-    def trace_mutations(target):
+    def trace_mutations(target, project=""):
+        resolved, err = _resolve_project(project)
+        if err:
+            return err
         if use_sqlite:
-            results = sqlite_db.trace_mutations(target)
+            results = sqlite_db.trace_mutations(target, project_path=resolved)
             results = _redact_paths_in_result(results)
             return {"content": [{"type": "text", "text": json.dumps(results, indent=2, default=str)}]}
-        ok, err = _db_available()
-        if not ok:
-            return _db_error_response(err)
         col = get_collection()
+        doc = col.find_one({"project_path": resolved}, {"mutations": 1, "_id": 0})
         results = []
-        for doc in col.find({}, {"mutations": 1, "_id": 0}):
+        if doc:
             for m in doc.get("mutations", []):
                 if target.lower() in m.get("target", "").lower():
                     results.append(m)
         results = _redact_paths_in_result(results)
         return {"content": [{"type": "text", "text": json.dumps(results, indent=2, default=str)}]}
 
-    def trace_calls(func_name):
+    def trace_calls(func_name, project=""):
+        resolved, err = _resolve_project(project)
+        if err:
+            return err
         if use_sqlite:
-            results = sqlite_db.trace_calls(func_name)
+            results = sqlite_db.trace_calls(func_name, project_path=resolved)
             results = _redact_paths_in_result(results)
             return {"content": [{"type": "text", "text": json.dumps(results, indent=2, default=str)}]}
-        ok, err = _db_available()
-        if not ok:
-            return _db_error_response(err)
         col = get_collection()
+        doc = col.find_one({"project_path": resolved}, {"call_graph": 1, "_id": 0})
         callers = []
         callees = []
-        for doc in col.find({}, {"call_graph": 1, "_id": 0}):
+        if doc:
             for edge in doc.get("call_graph", []):
                 if func_name.lower() in edge.get("caller", "").lower():
                     callers.append(edge)
@@ -398,19 +460,19 @@ def create_mcp_server(use_sqlite=True):
                     callees.append(edge)
         return {"content": [{"type": "text", "text": json.dumps(_redact_paths_in_result({"callers": callers, "callees": callees}), indent=2, default=str)}]}
 
-    def get_anomalies(severity=None):
+    def get_anomalies(project="", severity=None):
+        resolved, err = _resolve_project(project)
+        if err:
+            return err
         if use_sqlite:
-            results = sqlite_db.get_anomalies(severity=severity)
+            results = sqlite_db.get_anomalies(severity=severity, project_path=resolved)
             results = _redact_paths_in_result(results)
             return {"content": [{"type": "text", "text": json.dumps(results, indent=2, default=str)}]}
-        ok, err = _db_available()
-        if not ok:
-            return _db_error_response(err)
         col = get_collection()
+        doc = col.find_one({"project_path": resolved}, {"file_indices": 1, "_id": 0})
         results = []
-        for doc in col.find({}, {"file_indices": 1, "_id": 0}):
-            file_indices = doc.get("file_indices", {})
-            for fi in file_indices.values():
+        if doc:
+            for fi in doc.get("file_indices", {}).values():
                 for sym in fi.get("symbols", []):
                     risk_flags = sym.get("risk_flags", [])
                     if risk_flags:
@@ -440,7 +502,7 @@ def create_mcp_server(use_sqlite=True):
         except FileNotFoundError:
             return {"content": [{"type": "text", "text": f"File not found: {redacted_path}"}], "isError": True}
 
-    def index_project(project_path, enrich=False, incremental=False):
+    def index_project(project_path, name, enrich=False, incremental=False):
         from cil.models import CILIndex
         # Security: validate path is within allowed directories before any file reading
         allowed, err_msg = _is_path_allowed(project_path)
@@ -451,7 +513,11 @@ def create_mcp_server(use_sqlite=True):
             return {"content": [{"type": "text", "text": f"Directory not found: {_redact_path(project_path)}"}], "isError": True}
 
         if use_sqlite:
-            return _index_project_sqlite(project_path, enrich, incremental)
+            if not sqlite_db.env_db_path():
+                err = sqlite_db.validate_project_name(name) or sqlite_db.claim_project_name(name, project_path)
+                if err:
+                    return {"content": [{"type": "text", "text": f"Error: {err} Available names: {', '.join(sqlite_db.list_project_names()) or '(none)'}"}], "isError": True}
+            return _index_project_sqlite(project_path, name, enrich, incremental)
 
         ok, err = _db_available()
         if not ok:
@@ -488,10 +554,14 @@ def create_mcp_server(use_sqlite=True):
             "incremental": incremental,
         }, indent=2)}]}
 
-    def _index_project_sqlite(project_path, enrich, incremental):
+    def _index_project_sqlite(project_path, name, enrich, incremental):
+        db_path = None
+        if not sqlite_db.env_db_path():
+            db_path = sqlite_db.get_project_db_path(name)
+
         previous_index = None
         if incremental:
-            previous_index = sqlite_db.load_index(project_path)
+            previous_index = sqlite_db.load_index(project_path, db_path)
 
         indexer = Indexer()
         cil_index = indexer.index_directory(
@@ -501,10 +571,11 @@ def create_mcp_server(use_sqlite=True):
             previous_index=previous_index,
         )
 
-        sqlite_db.store_index(cil_index)
+        sqlite_db.store_index(cil_index, name, db_path)
 
         return {"content": [{"type": "text", "text": json.dumps({
             "status": "indexed",
+            "name": name if not sqlite_db.env_db_path() else None,
             "project_path": _redact_path(cil_index.project_path),
             "file_count": len(cil_index.file_indices),
             "symbol_count": sum(len(fi.symbols) for fi in cil_index.file_indices.values()),
@@ -512,24 +583,25 @@ def create_mcp_server(use_sqlite=True):
             "incremental": incremental,
         }, indent=2)}]}
 
-    def file_summary(path):
+    def file_summary(path, project=""):
         # Security: validate path is within allowed directories
         allowed, err_msg = _is_path_allowed(path)
         if not allowed:
             return {"content": [{"type": "text", "text": err_msg}], "isError": True}
 
         redacted_input = _redact_path(path)
+        resolved, err = _resolve_project(project)
+        if err:
+            return err
         if use_sqlite:
-            result = sqlite_db.get_file_summary(path)
+            result = sqlite_db.get_file_summary(path, project_path=resolved)
             if result is None:
                 return {"content": [{"type": "text", "text": f"File not found in index: {redacted_input}"}], "isError": True}
             result = _redact_paths_in_result(result)
             return {"content": [{"type": "text", "text": json.dumps(result, indent=2, default=str)}]}
-        ok, err = _db_available()
-        if not ok:
-            return _db_error_response(err)
         col = get_collection()
-        for doc in col.find({}, {"file_indices": 1, "_id": 0}):
+        doc = col.find_one({"project_path": resolved}, {"file_indices": 1, "_id": 0})
+        if doc:
             file_indices = doc.get("file_indices", {})
             if path in file_indices:
                 fi = file_indices[path]

@@ -2,6 +2,7 @@ import argparse
 import json
 import sys
 import os
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
@@ -10,9 +11,13 @@ from cil.database import get_collection, ensure_indexes
 from cil import sqlite_db
 
 
-def _norm(p: str) -> Path:
-    """Normalize a user-supplied path: expand ~ and resolve symlinks."""
+def _norm(p):
+    """Normalize a user-supplied path: expand ~ and resolve symlinks. Passes non-strings through."""
     from pathlib import Path
+    if p is None:
+        return None
+    if not isinstance(p, str):
+        return p
     return Path(p).expanduser().resolve(strict=False)
 
 
@@ -23,6 +28,8 @@ def main():
     # Index command
     index_parser = subparsers.add_parser("index", help="Index a project")
     index_parser.add_argument("project_path", help="Path to the project directory")
+    index_parser.add_argument("--name",
+        help="Mandatory (SQLite mode) unique DB name (e.g. 'nibia-admin'). Must not be used by another indexed project. Ignored with --mongo.")
     index_parser.add_argument("--enrich", action="store_true", help="Run LLM semantic enrichment")
     index_parser.add_argument("--force", action="store_true", help="Clear old index before re-indexing")
     index_parser.add_argument("--incremental", action="store_true", help="Only re-index changed files")
@@ -35,6 +42,7 @@ def main():
     # Query command
     query_parser = subparsers.add_parser("query", help="Query the index")
     query_parser.add_argument("symbol", help="Symbol name to find")
+    query_parser.add_argument("--project", required=True, help="Project path or name to query (required). Use 'cil status' to list projects.")
     query_parser.add_argument("--mongo", action="store_true", help="Use MongoDB instead of SQLite")
 
     # MCP server command
@@ -43,6 +51,7 @@ def main():
 
     # Anomalies command
     anom_parser = subparsers.add_parser("anomalies", help="List detected anomalies (Python files only)")
+    anom_parser.add_argument("--project", required=True, help="Project path or name to query (required). Use 'cil status' to list projects.")
     anom_parser.add_argument("--severity", choices=["low", "medium", "high"], help="Filter by severity")
     anom_parser.add_argument("--file", help="Filter by file path")
     anom_parser.add_argument("--mongo", action="store_true", help="Use MongoDB instead of SQLite")
@@ -64,10 +73,12 @@ def main():
     # SQLite-specific commands
     sqlite_parser = subparsers.add_parser("sqlite", help="SQLite database management")
     sqlite_sub = sqlite_parser.add_subparsers(dest="sqlite_command")
-    sqlite_sub.add_parser("init", help="Initialize SQLite database")
+    sqlite_init = sqlite_sub.add_parser("init", help="Initialize SQLite database")
+    sqlite_init.add_argument("--name", required=True, help="Custom project DB name")
     sqlite_sub.add_parser("migrate", help="Migrate data from MongoDB to SQLite")
     sqlite_query = sqlite_sub.add_parser("query", help="Query SQLite database")
     sqlite_query.add_argument("symbol", help="Symbol name to find")
+    sqlite_query.add_argument("--project", required=True, help="Project path or name to query (required)")
     sqlite_remove = sqlite_sub.add_parser("remove", help="Remove a project from SQLite")
     sqlite_remove.add_argument("project_path", help="Path to the project directory")
     sqlite_sub.add_parser("prune", help="Remove invalid paths from watch database")
@@ -186,15 +197,32 @@ def _index_sqlite(args):
     from cil.models import CILIndex
 
     project_path = str(_norm(args.project_path))
+    name = args.name
+
+    # Resolve target DB: legacy single-DB (env) or per-project (mandatory custom name)
+    _env_db = sqlite_db.env_db_path()
+    if _env_db:
+        db_path = _env_db
+    else:
+        if not name:
+            print("Error: --name is required in SQLite mode (unique DB name, e.g. 'nibia-admin').")
+            print("Indexed projects: " + (", ".join(sqlite_db.list_project_names()) or "(none)"))
+            sys.exit(1)
+        err = sqlite_db.validate_project_name(name) or sqlite_db.claim_project_name(name, project_path)
+        if err:
+            print(f"Error: {err}")
+            print("Indexed projects: " + (", ".join(sqlite_db.list_project_names()) or "(none)"))
+            sys.exit(1)
+        db_path = sqlite_db.get_project_db_path(name)
 
     # --force: clear old index
     if args.force:
-        sqlite_db.delete_project(project_path)
+        sqlite_db.delete_project(project_path, db_path)
 
     # Load previous index for incremental mode
     previous_index = None
     if args.incremental:
-        previous_index = sqlite_db.load_index(project_path)
+        previous_index = sqlite_db.load_index(project_path, db_path)
         if not previous_index:
             print("No previous index found, doing full index")
             args.incremental = False
@@ -207,10 +235,10 @@ def _index_sqlite(args):
         previous_index=previous_index,
     )
 
-    sqlite_db.store_index(cil_index)
+    sqlite_db.store_index(cil_index, name, db_path)
     sqlite_db.register_watched_path(project_path)
 
-    print(f"Indexed {cil_index.project_path}")
+    print(f"Indexed {name} -> {cil_index.project_path}")
     print(f"  Files: {len(cil_index.file_indices)}")
     print(f"  Symbols: {sum(len(fi.symbols) for fi in cil_index.file_indices.values())}")
     print(f"  Call edges: {len(cil_index.call_graph)}")
@@ -279,9 +307,26 @@ def _status_mongodb():
         print(f"  {doc['project_path']} (v{doc.get('version', '?')}) — {doc.get('indexed_at', '?')}")
 
 
+def _resolve_project_mongo(project):
+    """Resolve a project path/name to the indexed project_path in MongoDB."""
+    col = get_collection()
+    target = str(_norm(project))
+    if col.count_documents({"project_path": target}) > 0:
+        return target
+    stems = {}
+    for d in col.find({}, {"project_path": 1, "_id": 0}):
+        pp = d.get("project_path")
+        if pp:
+            stems[Path(pp).stem] = pp
+    return stems.get(Path(target).stem)
+
+
 def _query_sqlite(args):
     """Query the index from SQLite."""
-    results = sqlite_db.find_symbol(args.symbol)
+    if sqlite_db.resolve_project(args.project) is None:
+        print(f"Error: project '{args.project}' is not indexed. Available: {', '.join(sqlite_db.list_project_names())}")
+        sys.exit(1)
+    results = sqlite_db.find_symbol(args.symbol, project_path=args.project)
     if not results:
         print(f"No symbols matching '{args.symbol}'")
     for sym in results:
@@ -291,11 +336,15 @@ def _query_sqlite(args):
 
 def _query_mongodb(args):
     """Query the index from MongoDB."""
+    resolved = _resolve_project_mongo(args.project)
+    if resolved is None:
+        print(f"Error: project '{args.project}' is not indexed. Run 'cil status --mongo' to list projects.")
+        sys.exit(1)
     col = get_collection()
+    doc = col.find_one({"project_path": resolved}, {"file_indices": 1, "_id": 0})
     found = False
-    for doc in col.find({}, {"file_indices": 1, "_id": 0}):
-        file_indices = doc.get("file_indices", {})
-        for fi in file_indices.values():
+    if doc:
+        for fi in doc.get("file_indices", {}).values():
             for sym in fi.get("symbols", []):
                 if args.symbol.lower() in sym.get("name", "").lower():
                     print(f"  {sym['name']} — {sym['file_path']}:{sym['line_start']}-{sym['line_end']}")
@@ -307,7 +356,10 @@ def _query_mongodb(args):
 
 def _anomalies_sqlite(args):
     """List anomalies from SQLite."""
-    results = sqlite_db.get_anomalies(severity=args.severity)
+    if sqlite_db.resolve_project(args.project) is None:
+        print(f"Error: project '{args.project}' is not indexed. Available: {', '.join(sqlite_db.list_project_names())}")
+        sys.exit(1)
+    results = sqlite_db.get_anomalies(severity=args.severity, project_path=args.project)
     if args.file:
         results = [a for a in results if args.file in a.get("file_path", "")]
 
@@ -323,11 +375,15 @@ def _anomalies_sqlite(args):
 
 def _anomalies_mongodb(args):
     """List anomalies from MongoDB."""
+    resolved = _resolve_project_mongo(args.project)
+    if resolved is None:
+        print(f"Error: project '{args.project}' is not indexed. Run 'cil status --mongo' to list projects.")
+        sys.exit(1)
     col = get_collection()
+    doc = col.find_one({"project_path": resolved}, {"anomalies": 1, "_id": 0})
     results = []
-    for doc in col.find({}, {"anomalies": 1, "_id": 0}):
-        anomalies = doc.get("anomalies", [])
-        for a in anomalies:
+    if doc:
+        for a in doc.get("anomalies", []):
             if args.severity and a.get("severity") != args.severity:
                 continue
             if args.file and args.file not in a.get("file_path", ""):
@@ -374,10 +430,14 @@ def _enrich_sqlite():
                 batch = fi.symbols[i:i + batch_size]
                 print(f"  Enriching {file_path}:{batch[0].name}+{len(batch)-1}...")
                 enriched = enricher.enrich_batch(batch, source_map)
-                for j, sym in enumerate(enriched):
-                    fi.symbols[i + j] = sym
+        for j, sym in enumerate(enriched):
+                fi.symbols[i + j] = sym
 
-        sqlite_db.store_index(cil_index)
+        db_path = sqlite_db.resolve_project(cil_index.project_path)
+        if db_path is None:
+            print(f"  Skipping {cil_index.project_path}: not indexed")
+            continue
+        sqlite_db.store_index(cil_index, db_path.parent.name, db_path)
 
 
 def _enrich_mongodb():
@@ -419,15 +479,21 @@ def _enrich_mongodb():
 def _sqlite_command(args):
     """Handle SQLite-specific commands."""
     if args.sqlite_command == "init":
-        sqlite_db.initialize_db()
-        print(f"Database initialized at {sqlite_db.get_db_path()}")
+        err = sqlite_db.validate_project_name(args.name)
+        if err:
+            print(f"Error: {err}")
+            sys.exit(1)
+        sqlite_db.initialize_db(args.name, sqlite_db.get_project_db_path(args.name))
+        print(f"Database initialized at {sqlite_db.get_project_db_path(args.name)}")
 
     elif args.sqlite_command == "migrate":
-        sqlite_db.initialize_db()
         sqlite_db.migrate_from_mongodb()
 
     elif args.sqlite_command == "query":
-        results = sqlite_db.find_symbol(args.symbol)
+        if sqlite_db.resolve_project(args.project) is None:
+            print(f"Error: project '{args.project}' is not indexed. Available: {', '.join(sqlite_db.list_project_names())}")
+            sys.exit(1)
+        results = sqlite_db.find_symbol(args.symbol, project_path=args.project)
         print(json.dumps(results, indent=2, default=str))
 
     elif args.sqlite_command == "remove":

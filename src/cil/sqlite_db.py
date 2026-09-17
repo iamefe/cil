@@ -2,12 +2,22 @@ import sqlite3
 import json
 import logging
 import os
+import re
+import sys
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
 
 PROJECTS_DIR = Path.home() / ".cil" / "projects"
+
+
+def env_db_path() -> Optional[Path]:
+    """Legacy single-DB override via CIL_SQLITE_DB. Expands ``~`` to absolute."""
+    env_path = os.environ.get("CIL_SQLITE_DB")
+    if env_path:
+        return Path(env_path).expanduser()
+    return None
 
 
 def _norm_path(p: str) -> Path:
@@ -121,9 +131,19 @@ CREATE TABLE IF NOT EXISTS watched_paths (
 """
 
 
-def get_project_name(project_path: str) -> str:
-    """Derive a project name from the project path."""
-    return Path(project_path).stem
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def validate_project_name(name: str) -> Optional[str]:
+    """Validate a custom project DB name. Returns an error string, or None if valid."""
+    if not name:
+        return "Project name is required."
+    if not _NAME_RE.match(name):
+        return (
+            f"Invalid project name '{name}'. Use letters, digits, dot, dash, or underscore, "
+            "starting with a letter or digit."
+        )
+    return None
 
 
 def list_project_dbs() -> list[Path]:
@@ -133,32 +153,97 @@ def list_project_dbs() -> list[Path]:
     return sorted(PROJECTS_DIR.rglob("*.db"))
 
 
-def get_project_db_path(project_path: str) -> Path:
-    """Get the per-project SQLite database path.
+def get_project_db_path(name: str) -> Path:
+    """Get the per-project SQLite database path for a custom name.
 
-    Uses CIL_SQLITE_DB env var if set (legacy single-DB mode),
-    otherwise returns ~/.cil/projects/<project>/<project>.db
+    Returns ~/.cil/projects/<name>/<name>.db
     """
-    db_path = os.environ.get("CIL_SQLITE_DB")
-    if db_path:
-        return Path(db_path)
-    name = get_project_name(project_path)
     return PROJECTS_DIR / name / f"{name}.db"
 
 
 def get_db_path(project_path: Optional[str] = None) -> Path:
     """Get the SQLite database path.
 
-    CIL_SQLITE_DB env var always takes precedence (single-DB mode).
-    If project_path is provided and no env var, returns per-project DB path.
-    Otherwise raises.
+    CIL_SQLITE_DB env var always takes precedence (legacy single-DB mode).
+    Otherwise resolves project_path as a custom project name or a full
+    indexed path. Raises ValueError if it cannot be resolved.
     """
-    env_path = os.environ.get("CIL_SQLITE_DB")
-    if env_path:
-        return Path(env_path)
+    _env_db = env_db_path()
+    if _env_db:
+        return _env_db
     if project_path:
-        return get_project_db_path(project_path)
+        resolved = resolve_project(project_path)
+        if resolved is not None:
+            return resolved
+        raise ValueError(
+            f"Cannot resolve project '{project_path}'. "
+            f"Indexed projects: {', '.join(list_project_names()) or '(none)'}"
+        )
     raise ValueError("project_path is required when CIL_SQLITE_DB is not set")
+
+
+def _resolve_db_by_path(project_path: str) -> Optional[Path]:
+    """Scan per-project DBs and return the one whose projects table contains project_path."""
+    target = str(Path(project_path).expanduser())
+    for db in list_project_dbs():
+        try:
+            conn = get_connection(db)
+            rows = conn.execute("SELECT project_path FROM projects").fetchall()
+            conn.close()
+        except sqlite3.Error:
+            continue
+        for (pp,) in rows:
+            if str(pp) == target or str(Path(pp).expanduser()) == target:
+                return db
+    return None
+
+
+def resolve_project(project: str) -> Optional[Path]:
+    """Resolve a custom project name (preferred) or a full indexed path to its DB file.
+
+    Returns the DB path if resolvable, otherwise None.
+    In legacy single-DB mode (CIL_SQLITE_DB set), any input resolves to that DB.
+    """
+    if not project:
+        return None
+    _env_db = env_db_path()
+    if _env_db:
+        return _env_db
+    db_path = get_project_db_path(project)
+    if db_path.exists():
+        return db_path
+    return _resolve_db_by_path(project)
+
+
+def list_project_names() -> list[str]:
+    """Custom names of all indexed projects (per-project DB directory names)."""
+    return sorted({p.parent.name for p in list_project_dbs()})
+
+
+def claim_project_name(name: str, project_path: str) -> Optional[str]:
+    """Ensure `name` is free, or already bound to `project_path`.
+
+    Returns an error string if the name is invalid or already used by a
+    different project, otherwise None.
+    """
+    err = validate_project_name(name)
+    if err:
+        return err
+    db_path = get_project_db_path(name)
+    if db_path.exists():
+        try:
+            conn = get_connection(db_path)
+            rows = conn.execute("SELECT project_path FROM projects").fetchall()
+            conn.close()
+        except sqlite3.Error:
+            rows = []
+        for (pp,) in rows:
+            if str(Path(pp).expanduser()) != str(Path(project_path).expanduser()):
+                return (
+                    f"Project name '{name}' is already used by {pp}. "
+                    "Choose a different name or remove that project first."
+                )
+    return None
 
 
 _logger = logging.getLogger(__name__)
@@ -327,9 +412,9 @@ def upsert_project(project_path: str, version: int = 1, db_path: Optional[Path] 
     conn.execute(
         """
         INSERT INTO projects (project_path, indexed_at, version)
-        VALUES (?, datetime('now'), ?)
+        VALUES (?, datetime('now', 'localtime'), ?)
         ON CONFLICT(project_path) DO UPDATE SET
-            indexed_at = datetime('now'),
+            indexed_at = datetime('now', 'localtime'),
             version = excluded.version
         """,
         (project_path, version),
@@ -349,8 +434,11 @@ def delete_project(project_path: str, db_path: Optional[Path] = None) -> None:
 
 
 def remove_project(project_path: str) -> None:
-    """Remove a project record and delete its per-project DB file."""
-    db_path = get_project_db_path(project_path)
+    """Remove a project record and delete its per-project DB file.
+
+    project_path may be a custom project name or a full indexed path.
+    """
+    db_path = get_db_path(project_path)
     if db_path.exists():
         try:
             conn = get_connection(db_path)
@@ -367,10 +455,10 @@ def remove_project(project_path: str) -> None:
 
 
 def _get_db_path_for_project(project_path: str, db_path: Optional[Path] = None) -> Path:
-    """Get the DB path for a project, using provided db_path or deriving from project_path."""
+    """Get the DB path for a project (custom name or full path), or use the provided db_path."""
     if db_path is not None:
         return db_path
-    return get_project_db_path(project_path)
+    return get_db_path(project_path)
 
 
 def _scan_all_projects(func):
@@ -408,10 +496,10 @@ def upsert_file(project_id: int, file_path: str, file_hash: str, project_path: s
     conn.execute(
         """
         INSERT INTO files (project_id, file_path, file_hash, indexed_at, status)
-        VALUES (?, ?, ?, datetime('now'), 'active')
+        VALUES (?, ?, ?, datetime('now', 'localtime'), 'active')
         ON CONFLICT(project_id, file_path) DO UPDATE SET
             file_hash = excluded.file_hash,
-            indexed_at = datetime('now'),
+            indexed_at = datetime('now', 'localtime'),
             status = 'active'
         """,
         (project_id, file_path, file_hash),
@@ -549,9 +637,9 @@ def _find_symbol_in_db(name: str, db_path: Path) -> list[dict]:
         SELECT s.name, s.kind, s.line_start, s.line_end, s.signature, s.docstring,
                s.decorators, s.purpose, s.risk_flags, s.complexity, s.audit_notes,
                f.file_path
-        FROM symbols s
-        JOIN files f ON s.file_id = f.id
-        WHERE LOWER(s.name) LIKE LOWER(?)
+         FROM symbols s
+         JOIN files f ON s.file_id = f.id
+         WHERE LOWER(s.name) LIKE LOWER(?) AND s.status = 'active'
         """,
         (f"%{name}%",),
     )
@@ -580,9 +668,9 @@ def find_symbol(name: str, project_path: Optional[str] = None, db_path: Optional
         path = _get_db_path_for_project(project_path or "", db_path)
         return _find_symbol_in_db(name, path)
     # If CIL_SQLITE_DB is set, query that single DB
-    env_path = os.environ.get("CIL_SQLITE_DB")
-    if env_path:
-        return _find_symbol_in_db(name, Path(env_path))
+    _env_db = env_db_path()
+    if _env_db:
+        return _find_symbol_in_db(name, _env_db)
     return _scan_all_projects(_find_symbol_in_db)(name)
 
 
@@ -594,7 +682,7 @@ def _trace_mutations_in_db(target: str, db_path: Path) -> list[dict]:
         SELECT m.target, m.source, m.line, m.kind, p.project_path
         FROM mutations m
         JOIN projects p ON m.project_id = p.id
-        WHERE LOWER(m.target) LIKE LOWER(?)
+         WHERE LOWER(m.target) LIKE LOWER(?) AND m.status = 'active'
         """,
         (f"%{target}%",),
     )
@@ -607,9 +695,9 @@ def trace_mutations(target: str, project_path: Optional[str] = None, db_path: Op
         path = _get_db_path_for_project(project_path or "", db_path)
         return _trace_mutations_in_db(target, path)
     # If CIL_SQLITE_DB is set, query that single DB
-    env_path = os.environ.get("CIL_SQLITE_DB")
-    if env_path:
-        return _trace_mutations_in_db(target, Path(env_path))
+    _env_db = env_db_path()
+    if _env_db:
+        return _trace_mutations_in_db(target, _env_db)
     return _scan_all_projects(_trace_mutations_in_db)(target)
 
 
@@ -621,7 +709,7 @@ def _trace_calls_in_db(func_name: str, db_path: Path) -> dict:
         SELECT cg.caller, cg.callee, cg.line, p.project_path
         FROM call_graph cg
         JOIN projects p ON cg.project_id = p.id
-        WHERE LOWER(cg.caller) LIKE LOWER(?)
+         WHERE LOWER(cg.caller) LIKE LOWER(?) AND cg.status = 'active'
         """,
         (f"%{func_name}%",),
     )
@@ -630,7 +718,7 @@ def _trace_calls_in_db(func_name: str, db_path: Path) -> dict:
         SELECT cg.caller, cg.callee, cg.line, p.project_path
         FROM call_graph cg
         JOIN projects p ON cg.project_id = p.id
-        WHERE LOWER(cg.callee) LIKE LOWER(?)
+         WHERE LOWER(cg.callee) LIKE LOWER(?) AND cg.status = 'active'
         """,
         (f"%{func_name}%",),
     )
@@ -646,9 +734,9 @@ def trace_calls(func_name: str, project_path: Optional[str] = None, db_path: Opt
         path = _get_db_path_for_project(project_path or "", db_path)
         return _trace_calls_in_db(func_name, path)
     # If CIL_SQLITE_DB is set, query that single DB
-    env_path = os.environ.get("CIL_SQLITE_DB")
-    if env_path:
-        return _trace_calls_in_db(func_name, Path(env_path))
+    _env_db = env_db_path()
+    if _env_db:
+        return _trace_calls_in_db(func_name, _env_db)
     return _scan_all_projects(_trace_calls_in_db)(func_name)
 
 
@@ -661,7 +749,7 @@ def _get_anomalies_in_db(severity: Optional[str] = None, db_path: Path = None) -
             SELECT a.type, a.severity, a.file_path, a.line, a.message, p.project_path
             FROM anomalies a
             JOIN projects p ON a.project_id = p.id
-            WHERE a.severity = ?
+            WHERE a.severity = ? AND a.status = 'active'
             """,
             (severity,),
         )
@@ -671,6 +759,7 @@ def _get_anomalies_in_db(severity: Optional[str] = None, db_path: Path = None) -
             SELECT a.type, a.severity, a.file_path, a.line, a.message, p.project_path
             FROM anomalies a
             JOIN projects p ON a.project_id = p.id
+            WHERE a.status = 'active'
             """
         )
     return [dict(row) for row in cursor.fetchall()]
@@ -682,9 +771,9 @@ def get_anomalies(severity: Optional[str] = None, project_path: Optional[str] = 
         path = _get_db_path_for_project(project_path or "", db_path)
         return _get_anomalies_in_db(severity, path)
     # If CIL_SQLITE_DB is set, query that single DB
-    env_path = os.environ.get("CIL_SQLITE_DB")
-    if env_path:
-        return _get_anomalies_in_db(severity, Path(env_path))
+    _env_db = env_db_path()
+    if _env_db:
+        return _get_anomalies_in_db(severity, _env_db)
     return _scan_all_projects(_get_anomalies_in_db)(severity)
 
 
@@ -695,7 +784,7 @@ def _get_file_summary_in_db(file_path: str, db_path: Path) -> Optional[dict]:
         """
         SELECT f.id, f.file_path, f.file_hash, f.indexed_at
         FROM files f
-        WHERE f.file_path = ?
+        WHERE f.file_path = ? AND f.status = 'active'
         """,
         (file_path,),
     )
@@ -706,8 +795,8 @@ def _get_file_summary_in_db(file_path: str, db_path: Path) -> Optional[dict]:
         cursor = conn.execute(
             """
             SELECT f.id, f.file_path, f.file_hash, f.indexed_at
-            FROM files f
-            WHERE f.file_path LIKE ?
+        FROM files f
+        WHERE f.file_path LIKE ? AND f.status = 'active'
             """,
             (f"%{basename}",),
         )
@@ -720,7 +809,7 @@ def _get_file_summary_in_db(file_path: str, db_path: Path) -> Optional[dict]:
         """
         SELECT name, kind, line_start, line_end, signature, docstring,
                decorators, purpose, risk_flags, complexity, audit_notes
-        FROM symbols WHERE file_id = ?
+        FROM symbols WHERE file_id = ? AND status = 'active'
         """,
         (file_row["id"],),
     )
@@ -743,7 +832,7 @@ def _get_file_summary_in_db(file_path: str, db_path: Path) -> Optional[dict]:
 
     # Get imports
     imp_cursor = conn.execute(
-        "SELECT import_path FROM imports WHERE file_id = ?",
+        "SELECT import_path FROM imports WHERE file_id = ? AND status = 'active'",
         (file_row["id"],),
     )
     imports = [row["import_path"] for row in imp_cursor.fetchall()]
@@ -763,9 +852,9 @@ def get_file_summary(file_path: str, project_path: Optional[str] = None, db_path
         path = _get_db_path_for_project(project_path or "", db_path)
         return _get_file_summary_in_db(file_path, path)
     # If CIL_SQLITE_DB is set, query that single DB
-    env_path = os.environ.get("CIL_SQLITE_DB")
-    if env_path:
-        return _get_file_summary_in_db(file_path, Path(env_path))
+    _env_db = env_db_path()
+    if _env_db:
+        return _get_file_summary_in_db(file_path, _env_db)
     # Scan all project DBs
     for p in list_project_dbs():
         result = _get_file_summary_in_db(file_path, p)
@@ -792,9 +881,9 @@ def get_status(project_path: Optional[str] = None, db_path: Optional[Path] = Non
         )
         return [dict(row) for row in cursor.fetchall()]
     # If CIL_SQLITE_DB is set, query that single DB
-    env_path = os.environ.get("CIL_SQLITE_DB")
-    if env_path:
-        conn = get_connection(Path(env_path))
+    _env_db = env_db_path()
+    if _env_db:
+        conn = get_connection(_env_db)
         cursor = conn.execute(
             """
             SELECT p.project_path, p.indexed_at, p.version,
@@ -861,11 +950,29 @@ def db_status(project_path: Optional[str] = None, db_path: Optional[Path] = None
         return {"status": "error", "detail": str(e)}
 
 
-def store_index(cil_index, db_path: Optional[Path] = None) -> None:
-    """Store a CILIndex object into SQLite."""
+def store_index(cil_index, name: Optional[str] = None, db_path: Optional[Path] = None) -> None:
+    """Store a CILIndex object into the per-project DB identified by `name`.
+
+    `name` (custom project name) is mandatory unless CIL_SQLITE_DB is set
+    (legacy single-DB mode) or an explicit db_path is provided.
+    """
     from cil.models import CILIndex
 
     pp = cil_index.project_path
+    _env_db = env_db_path()
+    if _env_db:
+        db_path = db_path or _env_db
+    elif db_path is None:
+        if name is None:
+            raise ValueError(
+                "store_index requires a project name (custom DB name) "
+                "when CIL_SQLITE_DB is not set."
+            )
+        err = claim_project_name(name, pp)
+        if err:
+            raise ValueError(f"{err} Available names: {', '.join(list_project_names()) or '(none)'}")
+        db_path = get_project_db_path(name)
+
     initialize_db(pp, db_path)
     project_id = upsert_project(pp, cil_index.version, db_path)
 
@@ -984,8 +1091,13 @@ def load_index(project_path: str, db_path: Optional[Path] = None) -> Optional["C
     )
 
 
-def migrate_from_mongodb(project_path: Optional[str] = None, db_path: Optional[Path] = None) -> None:
-    """Migrate all data from MongoDB to SQLite. If project_path given, only migrate that project."""
+def migrate_from_mongodb(project_path: Optional[str] = None, db_path: Optional[Path] = None,
+                         names: Optional[dict[str, str]] = None) -> None:
+    """Migrate all data from MongoDB to SQLite. If project_path given, only migrate that project.
+
+    Each project needs a DB name: from `names` (path→name map), or resolved from
+    an existing per-project DB. Projects without a name are skipped.
+    """
     from cil.database import get_collection
     from cil.models import CILIndex
 
@@ -997,7 +1109,17 @@ def migrate_from_mongodb(project_path: Optional[str] = None, db_path: Optional[P
 
     for doc in docs:
         cil_index = CILIndex(**doc)
-        store_index(cil_index, db_path)
+        if db_path is None:
+            name = (names or {}).get(cil_index.project_path)
+            if not name:
+                db = resolve_project(cil_index.project_path)
+                name = db.parent.name if db else None
+            if not name:
+                print(f"Skipping {cil_index.project_path}: no DB name (pass names={{path: name}})")
+                continue
+            store_index(cil_index, name)
+        else:
+            store_index(cil_index, None, db_path)
         print(f"Migrated: {cil_index.project_path} ({len(cil_index.file_indices)} files)")
 
     print("Migration complete.")
@@ -1141,7 +1263,8 @@ if __name__ == "__main__":
     subparsers = parser.add_subparsers(dest="command")
 
     # Init command
-    subparsers.add_parser("init", help="Initialize the SQLite database")
+    init_parser = subparsers.add_parser("init", help="Initialize the SQLite database")
+    init_parser.add_argument("--name", required=True, help="Custom project DB name")
 
     # Migrate command
     subparsers.add_parser("migrate", help="Migrate data from MongoDB to SQLite")
@@ -1156,11 +1279,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.command == "init":
-        initialize_db()
-        print(f"Database initialized at {get_db_path()}")
+        err = validate_project_name(args.name)
+        if err:
+            print(f"Error: {err}")
+            sys.exit(1)
+        db_path = get_project_db_path(args.name)
+        initialize_db(db_path=db_path)
+        print(f"Database initialized at {db_path}")
 
     elif args.command == "migrate":
-        initialize_db()
         migrate_from_mongodb()
 
     elif args.command == "status":
