@@ -674,6 +674,14 @@ def create_mcp_server(use_sqlite=True):
             if not method:
                 continue
 
+            # Notifications (no "id") must not get a response per JSON-RPC.
+            if "id" not in req:
+                try:
+                    handle_request(req)
+                except Exception:
+                    pass
+                continue
+
             try:
                 result = handle_request(req)
                 send_response(result, req_id)

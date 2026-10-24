@@ -19,9 +19,13 @@ def _get_language(ext: str) -> Optional[Language]:
     if ext in (".py", ".pyi"):
         import tree_sitter_python as tspython
         lang = Language(tspython.language())
-    elif ext in (".ts", ".tsx"):
+    elif ext == ".ts":
         import tree_sitter_typescript as tstypescript
         lang = Language(tstypescript.language_typescript())
+    elif ext == ".tsx":
+        # JSX needs the tsx grammar; the plain typescript one errors on it
+        import tree_sitter_typescript as tstypescript
+        lang = Language(tstypescript.language_tsx())
     elif ext in (".js", ".jsx"):
         import tree_sitter_javascript as tsjs
         lang = Language(tsjs.language())
@@ -312,6 +316,9 @@ class ASTParser:
         elif node.type in (self.TS_CLASS, self.JS_CLASS):
             self._handle_js_class(node, file_path)
             new_parent = self._get_node_name(node)
+        elif node.type in (self.TS_METHOD, self.JS_METHOD):
+            self._handle_js_method(node, file_path)
+            new_parent = self._get_node_name(node)
         elif node.type in (self.TS_INTERFACE,):
             self._handle_ts_interface(node, file_path)
             new_parent = self._get_node_name(node)
@@ -445,6 +452,25 @@ class ASTParser:
             signature=f"class {name}",
         ))
 
+    def _handle_js_method(self, node, file_path: str):
+        name = self._get_node_name(node)
+        if not name:
+            return
+
+        sig = self._build_js_signature(node)
+
+        self.symbols.append(SymbolInfo(
+            name=name,
+            kind="method",
+            file_path=file_path,
+            line_start=node.start_point[0] + 1,
+            line_end=node.end_point[0] + 1,
+            signature=sig,
+        ))
+
+        caller_ref = f"{file_path}:{node.start_point[0] + 1}:{name}"
+        self._extract_js_calls(node, caller_ref)
+
     def _handle_ts_interface(self, node, file_path: str):
         name = self._get_node_name(node)
         if not name:
@@ -485,6 +511,22 @@ class ASTParser:
                         line=node.start_point[0] + 1,
                         kind="assign",
                     ))
+                    # `const useThing = () => ...` is a function too
+                    value = child.child_by_field_name("value")
+                    if name and value is not None and value.type in (
+                        self.TS_ARROW, "function_expression", "function",
+                    ):
+                        self.symbols.append(SymbolInfo(
+                            name=name,
+                            kind="function",
+                            file_path=file_path,
+                            line_start=node.start_point[0] + 1,
+                            line_end=node.end_point[0] + 1,
+                            signature=self._build_js_signature(value).replace(
+                                "function None", f"const {name} = ", 1),
+                        ))
+                        caller_ref = f"{file_path}:{node.start_point[0] + 1}:{name}"
+                        self._extract_js_calls(value, caller_ref)
 
     def _handle_js_assign(self, node, file_path: str, parent_name: str):
         target = self._get_js_assign_target(node)

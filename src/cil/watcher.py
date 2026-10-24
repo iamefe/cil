@@ -63,9 +63,9 @@ class FileWatcher:
         self.running = True
         handler = _make_handler(self)
         observer = Observer()
-        # SECURITY: refuse to follow symlinks — prevents symlink-based data exfiltration
-        observer.schedule(handler, self.project_path, recursive=True,
-                          follow_links=False)
+        # SECURITY: watchdog's schedule() has no follow-symlinks option, so
+        # symlink escapes are rejected per event by _is_within_project instead.
+        observer.schedule(handler, self.project_path, recursive=True)
         observer.start()
         print(f"Watching {self.project_path} for changes...")
 
@@ -179,6 +179,10 @@ def _make_handler(watcher: FileWatcher):
                 self.watcher._schedule_reindex()
 
         def on_deleted(self, event):
+            if self._safe_event(event):
+                self.watcher._schedule_reindex()
+
+        def on_moved(self, event):
             if self._safe_event(event):
                 self.watcher._schedule_reindex()
 

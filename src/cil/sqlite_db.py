@@ -1201,12 +1201,16 @@ def validate_all_paths() -> list[str]:
     """Validate all watched paths. Returns list of invalid paths."""
     _init_watch_db()
     conn = get_connection(_get_watch_db())
-    cursor = conn.execute("SELECT path FROM watched_paths")
+    paths = [row["path"] for row in conn.execute("SELECT path FROM watched_paths").fetchall()]
     invalid = []
-    for row in cursor:
-        p = row["path"]
+    for p in paths:
         if not os.path.exists(p):
-            mark_path_invalid(p, "Path does not exist")
+            # Same connection: a second one would block on this one's open
+            # write transaction and fail with "database is locked".
+            conn.execute(
+                "UPDATE watched_paths SET status = 'invalid', invalid_reason = ?, last_checked = CURRENT_TIMESTAMP WHERE path = ?",
+                ("Path does not exist", p)
+            )
             invalid.append(p)
         else:
             conn.execute(
