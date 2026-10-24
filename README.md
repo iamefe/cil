@@ -50,8 +50,10 @@ CIL uses [tree-sitter](https://tree-sitter.github.io/) for language-native parsi
 | Language | Extensions | Symbols Extracted |
 |---|---|---|
 | Python | `.py`, `.pyi` | functions, classes, decorators, assignments |
-| TypeScript | `.ts`, `.tsx` | functions, classes, interfaces, type aliases, variables |
-| JavaScript | `.js`, `.jsx` | functions, classes, variables, exports |
+| TypeScript | `.ts`, `.tsx` | functions (incl. `const x = () => …`), classes, class methods, interfaces, type aliases, variables |
+| JavaScript | `.js`, `.jsx` | functions (incl. `const x = () => …`), classes, class methods, variables, exports |
+
+`.tsx` is parsed with tree-sitter's TSX grammar (the plain TypeScript grammar fails on JSX). TS/JS class methods are stored with kind `method`; arrow-function and function-expression consts (React components, hooks) with kind `function`. Indexes built before these were supported are missing most TS/JS symbols — rebuild them with `--force`.
 | Go | `.go` | functions, methods, structs, consts |
 | Rust | `.rs` | functions, structs, consts, macros |
 | Java | `.java` | methods, constructors, classes, variables |
@@ -333,7 +335,7 @@ cil anomalies --project my-project --file src/server.py
 
 ### `cil watch <project_path>`
 
-Watch a directory for file changes and auto-reindex. Uses `watchdog` with a 2-second debounce. Requires a prior index — if no previous index exists, file changes are silently skipped.
+Watch a directory for file changes and auto-reindex. Uses `watchdog` with a 2-second debounce; any create, modify, delete or rename (`git mv`, branch switches) schedules one incremental reindex of the project. Requires a prior index — if no previous index exists, file changes are silently skipped.
 
 | Flag | Description |
 |---|---|
@@ -347,7 +349,9 @@ cil watch /path/to/project --enrich
 
 ### `cil watch-all`
 
-Watch all registered paths from the watch database. Validates paths on startup, skips invalid ones, and starts a watcher thread for each valid path. Use with launchd to auto-start at boot.
+Watch all registered paths from the watch database. Validates paths on startup (missing ones are marked `invalid`), skips invalid ones, and starts a watcher thread for each valid path. Use with launchd to auto-start at boot.
+
+`cil index <path> --name <name>` registers the path in `~/.cil/watch.db`, but a running `watch-all` reads the list only at startup — restart it to pick up new paths (see [Launchd Integration](#launchd-integration)).
 
 | Flag | Description |
 |---|---|
@@ -486,7 +490,7 @@ The MCP server exposes CIL as tools to any MCP-compatible agent (OpenCode, Claud
 
 ### OpenCode Integration
 
-Add the MCP server to your `~/.config/opencode/opencode.json`:
+Add the MCP server to your `~/.config/opencode/opencode.json`. Point `command` at the Python of the environment CIL is installed in (here its `.venv`), not the system `python3` — a system Python upgrade (e.g. Homebrew moving `python3` to a new minor version) leaves it without CIL's dependencies and the server dies with `ModuleNotFoundError: No module named 'dotenv'`:
 
 ```json
 {
@@ -494,7 +498,7 @@ Add the MCP server to your `~/.config/opencode/opencode.json`:
     "cil": {
       "type": "local",
       "command": [
-        "/usr/local/bin/python3",
+        "/path/to/cil/.venv/bin/python",
         "/path/to/cil/cil-mcp-entrypoint.py"
       ],
       "enabled": true,
@@ -517,23 +521,21 @@ cil serve
 Or use the entrypoint:
 
 ```bash
-python3 /path/to/cil/cil-mcp-entrypoint.py
+/path/to/cil/.venv/bin/python /path/to/cil/cil-mcp-entrypoint.py
 ```
 
 ### Claude Code Integration
 
-Add to your Claude Code MCP configuration:
+Register it once at user scope so it's available in every project:
 
-```json
-{
-  "mcpServers": {
-    "cil": {
-      "command": "python3",
-      "args": ["/path/to/cil/cil-mcp-entrypoint.py"]
-    }
-  }
-}
+```bash
+claude mcp add --scope user cil -- /path/to/cil/.venv/bin/python /path/to/cil/cil-mcp-entrypoint.py
+claude mcp list | grep cil     # expect: ✔ Connected
 ```
+
+After changing CIL's source, run `/mcp` in Claude Code and reconnect `cil` so the server loads the new code.
+
+The stdio server never replies to JSON-RPC notifications (messages without an `id`); Claude Code rejects servers that do.
 
 ## MCP Tools Reference
 
@@ -696,7 +698,8 @@ cil_get_body("src/config.py", 10, 25)
 - [x] MongoDB storage — optional alternative backend
 - [x] MCP integration — OpenCode, Claude Code, any MCP-compatible agent
 - [x] LLM semantic enrichment — purpose generation, risk scoring (optional, `--enrich`)
-- [x] File watch mode — auto-reindex on change (`cil watch`)
+- [x] File watch mode — auto-reindex on create/modify/delete/rename (`cil watch`)
+- [x] TS/JS class methods and arrow-function consts indexed; `.tsx` parsed with the TSX grammar
 - [x] Incremental indexing — only re-index changed files (`--incremental`)
 - [x] Flask API server — HTTP access to all index operations
 - [x] Project removal — clean up indexed projects (`cil remove`)
@@ -720,17 +723,25 @@ Auto-start CIL watchers at macOS boot using the provided launchd plist.
 cp com.cil.watch-all.plist ~/Library/LaunchAgents/
 ```
 
+   Its `ProgramArguments` must be `[".../.venv/bin/cil", "watch-all"]`. `watch-all` has no `--sqlite` flag (SQLite is the default); passing one makes it exit on startup with `unrecognized arguments: --sqlite`.
+
 2. Load the agent:
 
 ```bash
 launchctl load ~/Library/LaunchAgents/com.cil.watch-all.plist
 ```
 
-3. Verify it's running:
+3. Verify it's running — the first column must be a PID, not `-`:
 
 ```bash
-launchctl list | grep cil
-# Output: -    0    com.cil.watch-all
+launchctl list | grep com.cil.watch-all
+# Output: 24093    0    com.cil.watch-all
+```
+
+### Restart (after `cil index` adds a path, or after updating CIL)
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.cil.watch-all
 ```
 
 ### Unload
@@ -742,58 +753,27 @@ launchctl unload ~/Library/LaunchAgents/com.cil.watch-all.plist
 ### Logs
 
 ```bash
-tail -f /tmp/cil-watch-all.log
+tail -f /tmp/cil-watch-all.log           # stdout (buffered under launchd — often empty)
+tail -f /tmp/cil-watch-all-error.log     # crashes and tracebacks land here
 ```
 
 ### How It Works
 
-1. Register paths with `cil watch <path>`
+1. Register paths with `cil index <path> --name <name>` (or `cil watch <path>`)
 2. Paths are stored in `~/.cil/watch.db`
 3. `cil watch-all` reads all valid paths and starts a watcher for each
 4. launchd runs `cil watch-all` at boot and keeps it alive
 
-### CIL MCP Server
+### CIL MCP Server — don't run it under launchd
 
-Auto-start the CIL MCP server at boot for agent integration.
-
-#### Setup
-
-1. Copy the plist to your LaunchAgents directory:
+The MCP server speaks over stdio, so it must be started by the agent (OpenCode, Claude Code), which owns its stdin/stdout. Under launchd it has no client and exits immediately; `com.cil.mcp.plist` is retired. If it's still loaded:
 
 ```bash
-cp com.cil.mcp.plist ~/Library/LaunchAgents/
+launchctl bootout gui/$(id -u)/com.cil.mcp
+rm ~/Library/LaunchAgents/com.cil.mcp.plist
 ```
 
-2. Load the agent:
-
-```bash
-launchctl load ~/Library/LaunchAgents/com.cil.mcp.plist
-```
-
-3. Verify it's running:
-
-```bash
-launchctl list | grep cil
-# Output: -    0    com.cil.mcp
-```
-
-#### Unload
-
-```bash
-launchctl unload ~/Library/LaunchAgents/com.cil.mcp.plist
-```
-
-#### Logs
-
-```bash
-tail -f /tmp/cil-mcp.log
-```
-
-#### How It Works
-
-1. The MCP server runs `cil-mcp-entrypoint.py` with SQLite enabled
-2. It exposes 9 tools to any MCP-compatible agent
-3. launchd keeps the server alive and restarts it on crash
+Configure the server in your agent instead — see [MCP Server Setup](#mcp-server-setup).
 
 ## Soft-Delete Pattern
 
@@ -822,6 +802,24 @@ Schema version 3 adds a `status` column to all index tables:
 The migration is applied automatically on first access after the schema version check.
 
 ## Troubleshooting
+
+### MCP server won't start: `No module named 'dotenv'`
+
+The agent is launching the server with a Python that doesn't have CIL's dependencies — usually the system `python3` after a version upgrade. Point the MCP `command` at the CIL environment's Python (`/path/to/cil/.venv/bin/python`). See [MCP Server Setup](#mcp-server-setup).
+
+### Watcher not reindexing
+
+Check `launchctl list | grep com.cil.watch-all`: a `-` instead of a PID means it isn't running, and the second column is the last exit status. Read `/tmp/cil-watch-all-error.log`:
+
+- `unrecognized arguments: --sqlite` — remove the flag from the plist.
+- `database is locked` from `validate_all_paths` at startup, or `FSEventsObserver.schedule() got an unexpected keyword argument 'follow_links'` — both fixed on 2026-10-24; update CIL.
+- New project not picked up — restart the agent (`launchctl kickstart -k gui/$(id -u)/com.cil.watch-all`).
+
+### `cil_find_symbol` returns `[]` for a symbol that exists
+
+- The index predates the symbol, or the project isn't watched — run `cil index <path> --name <name> --incremental`.
+- It's a TS/JS class method or an arrow-function const and the index was built before those were supported — rebuild with `--force`.
+- Two DBs index the same path (e.g. an old `nibia-api` and a newer `api`): lookups by path use the first alphabetically. Query by the right name, or remove the stale DB.
 
 ### Python 3.14 Incompatibility
 
