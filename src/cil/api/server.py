@@ -306,9 +306,10 @@ def create_app(use_sqlite=True) -> Flask:
 
     @app.route("/cil/calls/<func_name>", methods=["GET"])
     def cil_calls(func_name: str):
-        """Find callers and callees for a function."""
+        """Find callers and callees for a function. ?include_builtins=1 keeps built-in callees."""
+        include_builtins = request.args.get("include_builtins", "").lower() in ("1", "true", "yes")
         if use_sqlite:
-            results = sqlite_db.trace_calls(func_name)
+            results = sqlite_db.trace_calls(func_name, include_builtins=include_builtins)
             return jsonify(_redact_paths_in_result(results))
         col = get_collection()
         callers = []
@@ -321,7 +322,10 @@ def create_app(use_sqlite=True) -> Flask:
                 if func_name in edge.get("callee", ""):
                     callers.append(edge)
 
-        return jsonify(_redact_paths_in_result({"callers": callers, "callees": callees}))
+        results = {"callers": callers, "callees": callees}
+        if not include_builtins:
+            results = sqlite_db.drop_noise_callees(results)
+        return jsonify(_redact_paths_in_result(results))
 
     @app.route("/cil/body", methods=["GET"])
     def cil_body():

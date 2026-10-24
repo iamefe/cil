@@ -222,6 +222,10 @@ def create_mcp_server(use_sqlite=True):
                         "type": "string",
                         "description": "Project to query: indexed project name (e.g., 'nibia') or full indexed path. Required. Use cil_status to list projects.",
                     },
+                    "include_builtins": {
+                        "type": "boolean",
+                        "description": "Include built-in callees (console.log, map, toString, ...). Default false.",
+                    },
                 },
                 "required": ["func_name", "project"],
             },
@@ -361,7 +365,8 @@ def create_mcp_server(use_sqlite=True):
             return trace_mutations(arguments.get("target", ""), arguments.get("project", ""))
 
         if name == "cil_trace_calls":
-            return trace_calls(arguments.get("func_name", ""), arguments.get("project", ""))
+            return trace_calls(arguments.get("func_name", ""), arguments.get("project", ""),
+                               bool(arguments.get("include_builtins", False)))
 
         if name == "cil_get_anomalies":
             return get_anomalies(arguments.get("project", ""), arguments.get("severity"))
@@ -440,12 +445,12 @@ def create_mcp_server(use_sqlite=True):
         results = _redact_paths_in_result(results)
         return {"content": [{"type": "text", "text": json.dumps(results, indent=2, default=str)}]}
 
-    def trace_calls(func_name, project=""):
+    def trace_calls(func_name, project="", include_builtins=False):
         resolved, err = _resolve_project(project)
         if err:
             return err
         if use_sqlite:
-            results = sqlite_db.trace_calls(func_name, project_path=resolved)
+            results = sqlite_db.trace_calls(func_name, project_path=resolved, include_builtins=include_builtins)
             results = _redact_paths_in_result(results)
             return {"content": [{"type": "text", "text": json.dumps(results, indent=2, default=str)}]}
         col = get_collection()
@@ -458,7 +463,10 @@ def create_mcp_server(use_sqlite=True):
                     callees.append(edge)
                 if func_name.lower() in edge.get("callee", "").lower():
                     callers.append(edge)
-        return {"content": [{"type": "text", "text": json.dumps(_redact_paths_in_result({"callers": callers, "callees": callees}), indent=2, default=str)}]}
+        results = {"callers": callers, "callees": callees}
+        if not include_builtins:
+            results = sqlite_db.drop_noise_callees(results)
+        return {"content": [{"type": "text", "text": json.dumps(_redact_paths_in_result(results), indent=2, default=str)}]}
 
     def get_anomalies(project="", severity=None):
         resolved, err = _resolve_project(project)

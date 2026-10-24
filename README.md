@@ -591,14 +591,19 @@ Trace all writes to a variable or global state. Returns every location that assi
 | `target` | string | yes | Variable or state to trace (e.g., `_VISION_READY`, `delivery.status`) |
 | `project` | string | yes | Project name or full indexed path |
 
-### `cil_trace_calls(func_name, project)`
+### `cil_trace_calls(func_name, project, include_builtins?)`
 
-Find callers and callees for a function. Returns the full call graph up and down.
+Find callers and callees for a function. Returns `{"callers": [...], "callees": [...]}`: `callers` are the edges where another function calls `func_name`; `callees` are the calls `func_name` makes. Names match by substring, so `processCommission` also matches `processCommissionsForOrder`.
+
+Built-in callees — console/logger calls, array/string/number helpers, `Math`/`JSON`/Promise methods, Python builtins (`NOISE_CALLEES` in `sqlite_db.py`) — are hidden by default so the project's own calls stand out. Data-access names (`find`, `findById`, `save`, `create`, `update`, `get`) are always kept.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `func_name` | string | yes | Function name to trace (e.g., `do_swap`, `updateStatus`) |
 | `project` | string | yes | Project name or full indexed path |
+| `include_builtins` | boolean | no | Also return built-in callees (default `false`) |
+
+Before 2026-10-24 the `callers` and `callees` keys were swapped.
 
 ### `cil_get_anomalies(project, severity?)`
 
@@ -642,7 +647,7 @@ python3 -c "from cil.api.server import create_app; app = create_app(use_sqlite=T
 | POST | `/cil/index` | Trigger re-index (body: `{"project_path": "...", "name": "my-project", "enrich": true, "incremental": true}`). `name` is required and uniqueness-validated in SQLite mode |
 | GET | `/cil/symbol/<name>` | Find symbol |
 | GET | `/cil/mutations/<target>` | Trace mutations |
-| GET | `/cil/calls/<func_name>` | Trace calls |
+| GET | `/cil/calls/<func_name>` | Trace calls across all projects (`?include_builtins=1` keeps built-in callees) |
 | GET | `/cil/body` | Get raw file lines (query: `file`, `start`, `end`) |
 | GET | `/cil/file/<path:path>` | File summary |
 | GET | `/cil/anomalies` | Anomaly detection |

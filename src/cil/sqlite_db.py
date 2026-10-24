@@ -472,6 +472,8 @@ def _scan_all_projects(func):
                 if isinstance(result, list):
                     all_results.extend(result)
                 elif isinstance(result, dict):
+                    if not isinstance(all_results, dict):
+                        all_results = {}
                     for k, v in result.items():
                         if k not in all_results:
                             all_results[k] = []
@@ -701,6 +703,45 @@ def trace_mutations(target: str, project_path: Optional[str] = None, db_path: Op
     return _scan_all_projects(_trace_mutations_in_db)(target)
 
 
+# Callee names that are almost always language/runtime built-ins (console and
+# logger calls, array/string/number helpers, Math/JSON/Promise, Python
+# builtins). Hidden from trace results by default so the project's own calls
+# stand out. Data-access names (find, save, create, update, get, ...) are
+# deliberately absent: those are usually the calls worth seeing.
+NOISE_CALLEES = frozenset({
+    # console / logger
+    "log", "warn", "error", "info", "debug", "trace", "verbose",
+    # arrays
+    "push", "pop", "shift", "unshift", "slice", "splice", "concat", "join",
+    "map", "filter", "reduce", "forEach", "some", "every", "includes",
+    "indexOf", "findIndex", "flat", "flatMap", "sort", "reverse", "fill",
+    "isArray", "from", "of",
+    # objects / JSON
+    "keys", "values", "entries", "assign", "freeze", "hasOwnProperty",
+    "stringify", "parse",
+    # strings / numbers / dates
+    "toString", "toFixed", "toLowerCase", "toUpperCase", "trim", "split",
+    "replace", "replaceAll", "startsWith", "endsWith", "padStart", "padEnd",
+    "substring", "charAt", "match", "test", "localeCompare", "toLocaleString",
+    "parseInt", "parseFloat", "isNaN", "isFinite", "Number", "String", "Boolean",
+    "now", "getTime", "toISOString", "getFullYear", "getMonth", "getDate",
+    "setDate", "round", "floor", "ceil", "max", "min", "abs", "pow", "random",
+    # promises
+    "then", "catch", "finally", "resolve", "reject", "all", "allSettled",
+    # python builtins
+    "print", "len", "str", "int", "float", "bool", "dict", "list", "set",
+    "tuple", "isinstance", "range", "enumerate", "zip", "append", "extend",
+    "items", "format", "strip", "sorted", "super", "getattr", "setattr",
+    "hasattr", "any", "sum", "repr", "type",
+})
+
+
+def drop_noise_callees(result: dict) -> dict:
+    """Remove built-in calls (see NOISE_CALLEES) from a trace_calls result's callees."""
+    result["callees"] = [e for e in result.get("callees", []) if e.get("callee") not in NOISE_CALLEES]
+    return result
+
+
 def _trace_calls_in_db(func_name: str, db_path: Path) -> dict:
     """Trace calls in a single project DB."""
     conn = get_connection(db_path)
@@ -729,16 +770,21 @@ def _trace_calls_in_db(func_name: str, db_path: Path) -> dict:
     }
 
 
-def trace_calls(func_name: str, project_path: Optional[str] = None, db_path: Optional[Path] = None) -> dict:
-    """Find callers and callees for a function. If project_path is given, only search that project."""
+def trace_calls(func_name: str, project_path: Optional[str] = None, db_path: Optional[Path] = None,
+                include_builtins: bool = False) -> dict:
+    """Find callers and callees for a function. If project_path is given, only search that project.
+
+    Built-in callees (NOISE_CALLEES) are dropped unless include_builtins is set.
+    """
     if project_path or db_path:
         path = _get_db_path_for_project(project_path or "", db_path)
-        return _trace_calls_in_db(func_name, path)
-    # If CIL_SQLITE_DB is set, query that single DB
-    _env_db = env_db_path()
-    if _env_db:
-        return _trace_calls_in_db(func_name, _env_db)
-    return _scan_all_projects(_trace_calls_in_db)(func_name)
+        result = _trace_calls_in_db(func_name, path)
+    elif env_db_path():
+        # If CIL_SQLITE_DB is set, query that single DB
+        result = _trace_calls_in_db(func_name, env_db_path())
+    else:
+        result = _scan_all_projects(_trace_calls_in_db)(func_name)
+    return result if include_builtins else drop_noise_callees(result)
 
 
 def _get_anomalies_in_db(severity: Optional[str] = None, db_path: Path = None) -> list[dict]:
