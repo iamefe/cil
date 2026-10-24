@@ -455,9 +455,9 @@ def create_mcp_server(use_sqlite=True):
         if doc:
             for edge in doc.get("call_graph", []):
                 if func_name.lower() in edge.get("caller", "").lower():
-                    callers.append(edge)
-                if func_name.lower() in edge.get("callee", "").lower():
                     callees.append(edge)
+                if func_name.lower() in edge.get("callee", "").lower():
+                    callers.append(edge)
         return {"content": [{"type": "text", "text": json.dumps(_redact_paths_in_result({"callers": callers, "callees": callees}), indent=2, default=str)}]}
 
     def get_anomalies(project="", severity=None):

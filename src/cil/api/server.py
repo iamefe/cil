@@ -317,9 +317,9 @@ def create_app(use_sqlite=True) -> Flask:
         for doc in col.find({}, {"call_graph": 1, "_id": 0}):
             for edge in doc.get("call_graph", []):
                 if func_name in edge.get("caller", ""):
-                    callers.append(edge)
-                if func_name in edge.get("callee", ""):
                     callees.append(edge)
+                if func_name in edge.get("callee", ""):
+                    callers.append(edge)
 
         return jsonify(_redact_paths_in_result({"callers": callers, "callees": callees}))
 

@@ -704,7 +704,8 @@ def trace_mutations(target: str, project_path: Optional[str] = None, db_path: Op
 def _trace_calls_in_db(func_name: str, db_path: Path) -> dict:
     """Trace calls in a single project DB."""
     conn = get_connection(db_path)
-    callers = conn.execute(
+    # Edges where func_name is the caller are its callees, and vice versa.
+    callees = conn.execute(
         """
         SELECT cg.caller, cg.callee, cg.line, p.project_path
         FROM call_graph cg
@@ -713,7 +714,7 @@ def _trace_calls_in_db(func_name: str, db_path: Path) -> dict:
         """,
         (f"%{func_name}%",),
     )
-    callees = conn.execute(
+    callers = conn.execute(
         """
         SELECT cg.caller, cg.callee, cg.line, p.project_path
         FROM call_graph cg
